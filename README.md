@@ -4,10 +4,9 @@ Command line tool for manipulating ZX Spectrum `SCREEN$` (`.scr`) files —
 standard resolution **and** the Timex SCLD extended modes (hi-colour and
 hi-res).
 
-Part of the LOADZX toolset, alongside [`taput`](../taput) (TAP files) and
-[`tomato`](../tomato) (TOS disk images). Like `taput`, it is a single,
-dependency-free C translation unit; PNG decoding uses the vendored,
-public-domain `stb_image.h`, and PNG/GIF encoding is hand-rolled (no zlib).
+Like `taput`, it is a single, dependency-free C translation unit; PNG 
+decoding uses the vendored, public-domain `stb_image.h`, and PNG/GIF 
+encoding is hand-rolled (no zlib).
 
 ## Usage
 
@@ -40,10 +39,10 @@ Examples:
     scrtools png2scr factory.png factory.scr
     scrtools png2scr --mode hires logo512.png logo.scr
     scrtools png2scr --mode hicolour pic.png pic.scr
-    scrtools scr2png factory.scr factory.png
-    scrtools scr2png --palette emulator factory.scr factory.png
+    scrtools scr2png demo.scr demo.png
+    scrtools scr2png --palette emulator demo.scr demo.png
     scrtools scr2gif --scale 2 demo.scr demo.gif
-    scrtools info factory.scr
+    scrtools info demo.scr
 ```
 
 ## Screen modes
