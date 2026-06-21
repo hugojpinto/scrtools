@@ -4,9 +4,9 @@ Command line tool for manipulating ZX Spectrum `SCREEN$` (`.scr`) files —
 standard resolution **and** the Timex SCLD extended modes (hi-colour and
 hi-res).
 
-Like `taput`, it is a single, dependency-free C translation unit; PNG 
-decoding uses the vendored, public-domain `stb_image.h`, and PNG/GIF 
-encoding is hand-rolled (no zlib).
+It is a single, dependency-free C translation unit; PNG decoding uses the
+vendored, public-domain `stb_image.h`, and PNG/GIF encoding is hand-rolled
+(no zlib).
 
 ## Usage
 
