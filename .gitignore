@@ -1,0 +1,6 @@
+*.o
+scrtools
+scrtools-linux
+scrtools.exe
+.DS_Store
+examples/
