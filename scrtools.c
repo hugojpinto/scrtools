@@ -80,7 +80,7 @@ typedef unsigned char byte;
 // ATTR_AT: byte index (0..767) of the attribute cell covering pixel (x,y).
 //   Cells are 8x8, laid out left-to-right, top-to-bottom: 32 per row, 24 rows.
 //   (y>>3) = cell row, (x>>3) = cell column.
-#define ATTR_AT(y, x) ((y >> 3) * 32 + (x >> 3))
+#define ATTR_AT(y, x) (((y) >> 3) * 32 + ((x) >> 3))
 
 // PIX_OFF: byte index (0..6143) holding the 8 horizontal pixels at (x,y) in
 // the Spectrum's famously non-linear bitmap layout. The display file is split
@@ -92,7 +92,7 @@ typedef unsigned char byte;
 //   ((y>>3)&7)*32    -> character row within the current third (0..7)
 //   (y>>6)*2048      -> which third of the screen (0..2)
 // The most significant bit (0x80) of each byte is the leftmost pixel.
-#define PIX_OFF(y, x) ((x >> 3) + (y & 7) * 256 + ((y >> 3) & 7) * 32 + (y >> 6) * 2048)
+#define PIX_OFF(y, x) (((x) >> 3) + ((y) & 7) * 256 + (((y) >> 3) & 7) * 32 + ((y) >> 6) * 2048)
 
 // Default render palette. Modern de-facto standard (Wikipedia / retrotechlab):
 // normal level 0xD7 (215, ~85% of the measured ULA voltage ratio), bright 0xFF.
@@ -132,6 +132,8 @@ static const char *Help =
     "                     0-255 (default 215 = 0xD7). Bright stays 255.\n"
     "    --palette <p>    Named level preset: standard (215, default),\n"
     "                     classic (205), emulator (192).\n"
+    "    --dither         png2scr: Floyd-Steinberg dither the bitmap between\n"
+    "                     each cell's two colours (helps shaded images).\n"
     "    --scale <n>      Upscale scr2png / scr2gif output by factor n.\n"
     "    --delay <cs>     FLASH frame delay for scr2gif, centiseconds\n"
     "                     (default 32 = the hardware ~1.56 Hz rate).\n"
@@ -322,10 +324,6 @@ static int classify(byte r, byte g, byte b, int *bright)
     *bright = hi;
     return (gon << 2) | (ron << 1) | bon;
 }
-
-// Hamming distance between two 3-bit colour codes (used to snap a stray pixel
-// to whichever of a cell's two chosen colours it is nearest).
-static int colourDist(int a, int b) { return __builtin_popcount(a ^ b); }
 
 //~~~~ ULAplus (GRB332 64-colour palette) ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~//
 // A ULAplus screen appends 64 palette registers, one byte each, in the layout
@@ -537,17 +535,154 @@ static const byte *samplePx(const byte *px, int w, int f, int lx, int ly)
     return px + ((size_t)(ly * f) * w + (lx * f)) * 3;
 }
 
+//~~~~ Higher-quality quantisation (2-means, median-cut, dithering) ~~~~~~~//
+
+// Two representative GRB332 colours for a cw x ch cell, via k=2 Lloyd's
+// algorithm (better than picking the two most frequent for shaded cells). The
+// more populous cluster becomes PAPER, the other INK (equal if single-colour).
+static void cellTwoColours(const byte *px, int w, int f, int x0, int y0,
+                           int cw, int ch, int *ink, int *paper)
+{
+    int n = cw * ch;
+    const byte *p0 = samplePx(px, w, f, x0, y0);
+    double m0[3] = { p0[0], p0[1], p0[2] }, m1[3];
+    // Seed the second centroid at the pixel farthest from the first.
+    int bd = -1; m1[0] = m0[0]; m1[1] = m0[1]; m1[2] = m0[2];
+    for (int j = 0; j < n; j++)
+    {
+        const byte *p = samplePx(px, w, f, x0 + j % cw, y0 + j / cw);
+        int dr = p[0] - (int)m0[0], dg = p[1] - (int)m0[1], db = p[2] - (int)m0[2];
+        int d = dr * dr + dg * dg + db * db;
+        if (d > bd) { bd = d; m1[0] = p[0]; m1[1] = p[1]; m1[2] = p[2]; }
+    }
+    int n0 = n, n1 = 0;
+    for (int it = 0; it < 8; it++)
+    {
+        double s0[3] = {0,0,0}, s1[3] = {0,0,0}; n0 = 0; n1 = 0;
+        for (int j = 0; j < n; j++)
+        {
+            const byte *p = samplePx(px, w, f, x0 + j % cw, y0 + j / cw);
+            double d0 = 0, d1 = 0;
+            for (int c = 0; c < 3; c++) { double a = p[c]-m0[c], b = p[c]-m1[c]; d0 += a*a; d1 += b*b; }
+            if (d0 <= d1) { s0[0]+=p[0]; s0[1]+=p[1]; s0[2]+=p[2]; n0++; }
+            else          { s1[0]+=p[0]; s1[1]+=p[1]; s1[2]+=p[2]; n1++; }
+        }
+        if (n0) for (int c = 0; c < 3; c++) m0[c] = s0[c] / n0;
+        if (n1) for (int c = 0; c < 3; c++) m1[c] = s1[c] / n1;
+    }
+    byte a = rgbToPlus((int)(m0[0]+0.5), (int)(m0[1]+0.5), (int)(m0[2]+0.5));
+    byte b = rgbToPlus((int)(m1[0]+0.5), (int)(m1[1]+0.5), (int)(m1[2]+0.5));
+    if (n0 >= n1) { *paper = a; *ink = n1 ? b : a; }
+    else          { *paper = b; *ink = a; }
+}
+
+// Reduce a weighted set of GRB332 colours to <=k representatives (GRB332 bytes,
+// written to out, count returned). Classic median-cut: repeatedly split the box
+// with the largest channel spread at its weighted median, then average each box.
+static int medianCut(const byte *cols, const int *wts, int n, int k, byte *out)
+{
+    if (n <= 0) return 0;
+    if (k > 8) k = 8;
+    int *R = (int*)malloc(sizeof(int)*n), *G = (int*)malloc(sizeof(int)*n);
+    int *B = (int*)malloc(sizeof(int)*n), *W = (int*)malloc(sizeof(int)*n);
+    int *idx = (int*)malloc(sizeof(int)*n);
+    if (!R||!G||!B||!W||!idx) die("Memory allocation error", NULL);
+    for (int i = 0; i < n; i++)
+    { byte r,g,b; plusToRGB(cols[i], &r,&g,&b); R[i]=r; G[i]=g; B[i]=b; W[i]=wts[i]; idx[i]=i; }
+
+    int bl[8], bh[8], nb = 1; bl[0] = 0; bh[0] = n;
+    while (nb < k)
+    {
+        int best = -1; long bestSpread = -1; int bestAxis = 0;
+        for (int bi = 0; bi < nb; bi++)
+        {
+            if (bh[bi] - bl[bi] <= 1) continue;
+            int mn[3] = {255,255,255}, mx[3] = {0,0,0};
+            for (int j = bl[bi]; j < bh[bi]; j++)
+            { int p = idx[j]; int v[3]={R[p],G[p],B[p]};
+              for (int c=0;c<3;c++){ if(v[c]<mn[c])mn[c]=v[c]; if(v[c]>mx[c])mx[c]=v[c]; } }
+            for (int c = 0; c < 3; c++)
+            { long sp = mx[c]-mn[c]; if (sp > bestSpread) { bestSpread = sp; best = bi; bestAxis = c; } }
+        }
+        if (best < 0 || bestSpread <= 0) break;
+        // Insertion-sort this box's indices along the chosen axis.
+        int *chan = bestAxis == 0 ? R : bestAxis == 1 ? G : B;
+        for (int a = bl[best]+1; a < bh[best]; a++)
+        { int t = idx[a], j = a-1; while (j >= bl[best] && chan[idx[j]] > chan[t]) { idx[j+1]=idx[j]; j--; } idx[j+1]=t; }
+        // Split at the weighted median.
+        long total = 0; for (int j = bl[best]; j < bh[best]; j++) total += W[idx[j]];
+        long acc = 0; int mid = bl[best]+1;
+        for (int j = bl[best]; j < bh[best]-1; j++) { acc += W[idx[j]]; if (acc*2 >= total) { mid = j+1; break; } }
+        bl[nb] = mid; bh[nb] = bh[best]; bh[best] = mid; nb++;
+    }
+    for (int bi = 0; bi < nb; bi++)
+    {
+        double sr=0,sg=0,sb=0; long sw=0;
+        for (int j = bl[bi]; j < bh[bi]; j++)
+        { int p = idx[j]; sr += (double)R[p]*W[p]; sg += (double)G[p]*W[p]; sb += (double)B[p]*W[p]; sw += W[p]; }
+        if (!sw) sw = 1;
+        out[bi] = rgbToPlus((int)(sr/sw+0.5), (int)(sg/sw+0.5), (int)(sb/sw+0.5));
+    }
+    free(R); free(G); free(B); free(W); free(idx);
+    return nb;
+}
+
+// Floyd-Steinberg error buffers (two rolling rows of RGB residual).
+static double gErr[2][SCR_W][3];
+
+// Emit the 6144-byte bitmap for a 256-wide attribute screen. Each pixel is set
+// to INK or PAPER by nearest colour to (source + diffused error). cellH is 8
+// for standard, 1 for hi-colour; cell colours are passed as packed RGB arrays
+// indexed by (y/cellH)*32 + x/8.
+static void emitBitmap256(const byte *px, int w, int f, const byte *cellInkRGB,
+                          const byte *cellPaperRGB, int cellH, byte *bmp, int dither)
+{
+    memset(gErr, 0, sizeof gErr);
+    for (int y = 0; y < SCR_H; y++)
+    {
+        double (*cur)[3] = gErr[y & 1], (*nxt)[3] = gErr[(y + 1) & 1];
+        for (int x = 0; x < SCR_W; x++) for (int c = 0; c < 3; c++) nxt[x][c] = 0;
+        int cellRow = y / cellH;
+        int bits = 0;
+        for (int x = 0; x < SCR_W; x++)
+        {
+            int cell = cellRow * 32 + (x >> 3);
+            const byte *ink = cellInkRGB + cell * 3, *pap = cellPaperRGB + cell * 3;
+            const byte *p = samplePx(px, w, f, x, y);
+            double t[3];
+            for (int c = 0; c < 3; c++) t[c] = p[c] + (dither ? cur[x][c] : 0);
+            double di = 0, dp = 0;
+            for (int c = 0; c < 3; c++) { double a = t[c]-ink[c], b = t[c]-pap[c]; di += a*a; dp += b*b; }
+            const byte *chosen = (di <= dp) ? ink : pap;
+            if (di <= dp) bits |= (0x80 >> (x & 7));
+            if (dither)
+            {
+                for (int c = 0; c < 3; c++)
+                {
+                    double e = t[c] - chosen[c];
+                    if (x + 1 < SCR_W) cur[x+1][c] += e * 7.0/16;
+                    if (x > 0) nxt[x-1][c] += e * 3.0/16;
+                    nxt[x][c] += e * 5.0/16;
+                    if (x + 1 < SCR_W) nxt[x+1][c] += e * 1.0/16;
+                }
+            }
+            if ((x & 7) == 7) { bmp[PIX_OFF(y, x & ~7)] = (byte)bits; bits = 0; }
+        }
+    }
+}
+
 //~~~~ png2scr: standard (8x8 attributes) ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~//
 
-static void cmdPng2ScrStd(const char *in, const char *out)
+static void cmdPng2ScrStd(const char *in, const char *out, int dither)
 {
     int w, h, f;
     byte *px = loadPngRGB(in, SCR_W, &w, &h, &f);
     byte scr[SCR_SIZE];
     memset(scr, 0, sizeof scr);
 
-    // Resolve one INK / PAPER / BRIGHT per 8x8 cell (see the cell algorithm
-    // notes inline below). A faithful Spectrum render is lossless here.
+    // Resolve one INK / PAPER / BRIGHT per 8x8 cell, recording each cell's two
+    // colours as RGB for the (optionally dithered) bitmap pass.
+    byte cellInk[24 * 32 * 3], cellPaper[24 * 32 * 3];
     for (int cy = 0; cy < 24; cy++)
         for (int cx = 0; cx < 32; cx++)
         {
@@ -574,42 +709,34 @@ static void cmdPng2ScrStd(const char *in, const char *out)
             // (a black pixel is ambiguous, so majority would lose sparse cells).
             int bright = (brightVotes > 0);
 
-            scr[SCR_PIXELS + cy * 32 + cx] =
-                (byte)(((bright ? 1 : 0) << 6) | (paper << 3) | ink);
-
-            // Emit the bitmap: a pixel is INK when nearer the ink colour.
-            for (int py = 0; py < 8; py++)
-            {
-                int y = cy * 8 + py, bits = 0;
-                for (int pxl = 0; pxl < 8; pxl++)
-                {
-                    const byte *p = samplePx(px, w, f, cx * 8 + pxl, y);
-                    int br, idx = classify(p[0], p[1], p[2], &br);
-                    if (colourDist(idx, ink) < colourDist(idx, paper))
-                        bits |= (0x80 >> pxl);   // leftmost pixel = high bit
-                }
-                scr[PIX_OFF(y, cx * 8)] = (byte)bits;
-            }
+            int cell = cy * 32 + cx;
+            scr[SCR_PIXELS + cell] = (byte)((bright << 6) | (paper << 3) | ink);
+            indexToRGB(ink,   bright, DEF_NORMAL, &cellInk[cell*3],   &cellInk[cell*3+1],   &cellInk[cell*3+2]);
+            indexToRGB(paper, bright, DEF_NORMAL, &cellPaper[cell*3], &cellPaper[cell*3+1], &cellPaper[cell*3+2]);
         }
 
+    emitBitmap256(px, w, f, cellInk, cellPaper, 8, scr, dither);
     stbi_image_free(px);
     writeFile(out, scr, SCR_SIZE);
-    printf("Wrote %s (%d bytes, standard)\n", out, SCR_SIZE);
+    printf("Wrote %s (%d bytes, standard%s)\n", out, SCR_SIZE, dither ? ", dithered" : "");
 }
 
 //~~~~ png2scr: Timex hi-colour (8x1 attributes) ~~~~~~~~~~~~~~~~~~~~~~~~~~~//
 
-static void cmdPng2ScrHiColour(const char *in, const char *out)
+static void cmdPng2ScrHiColour(const char *in, const char *out, int dither)
 {
     int w, h, f;
     byte *px = loadPngRGB(in, SCR_W, &w, &h, &f);
     byte *scr = (byte *)calloc(TMX_SIZE, 1);
     if (!scr) die("Memory allocation error", NULL);
-    byte *bmp = scr, *att = scr + SCR_PIXELS;
+    byte *att = scr + SCR_PIXELS;
 
     // Same idea as standard, but a "cell" is now a single 8x1 strip: one
     // attribute per scanline per 8-pixel column. Bitmap byte and attribute byte
     // share the interleaved offset PIX_OFF(y, cx*8).
+    byte *cellInk = (byte *)malloc((size_t)SCR_H * 32 * 3);
+    byte *cellPaper = (byte *)malloc((size_t)SCR_H * 32 * 3);
+    if (!cellInk || !cellPaper) die("Memory allocation error", NULL);
     for (int y = 0; y < SCR_H; y++)
         for (int cx = 0; cx < 32; cx++)
         {
@@ -629,29 +756,24 @@ static void cmdPng2ScrHiColour(const char *in, const char *out)
             int ink = (best2 < 0) ? paper : best2;
             int bright = (brightVotes > 0);
 
-            int o = PIX_OFF(y, cx * 8);
-            att[o] = (byte)(((bright ? 1 : 0) << 6) | (paper << 3) | ink);
-
-            int bits = 0;
-            for (int pxl = 0; pxl < 8; pxl++)
-            {
-                const byte *p = samplePx(px, w, f, cx * 8 + pxl, y);
-                int br, idx = classify(p[0], p[1], p[2], &br);
-                if (colourDist(idx, ink) < colourDist(idx, paper))
-                    bits |= (0x80 >> pxl);
-            }
-            bmp[o] = (byte)bits;
+            int cell = y * 32 + cx;
+            att[PIX_OFF(y, cx * 8)] = (byte)((bright << 6) | (paper << 3) | ink);
+            indexToRGB(ink,   bright, DEF_NORMAL, &cellInk[cell*3],   &cellInk[cell*3+1],   &cellInk[cell*3+2]);
+            indexToRGB(paper, bright, DEF_NORMAL, &cellPaper[cell*3], &cellPaper[cell*3+1], &cellPaper[cell*3+2]);
         }
 
+    emitBitmap256(px, w, f, cellInk, cellPaper, 1, scr, dither);
     stbi_image_free(px);
     writeFile(out, scr, TMX_SIZE);
-    free(scr);
-    printf("Wrote %s (%d bytes, Timex hi-colour)\n", out, TMX_SIZE);
+    free(scr); free(cellInk); free(cellPaper);
+    printf("Wrote %s (%d bytes, Timex hi-colour%s)\n", out, TMX_SIZE, dither ? ", dithered" : "");
 }
 
 //~~~~ png2scr: Timex hi-res (512x192 mono + colour byte) ~~~~~~~~~~~~~~~~~~//
 
-static void cmdPng2ScrHiRes(const char *in, const char *out)
+static double gErrHi[2][HIRES_W][3];
+
+static void cmdPng2ScrHiRes(const char *in, const char *out, int dither)
 {
     int w, h, f;
     byte *px = loadPngRGB(in, HIRES_W, &w, &h, &f);
@@ -683,21 +805,42 @@ static void cmdPng2ScrHiRes(const char *in, const char *out)
     if (!scr) die("Memory allocation error", NULL);
     byte *bank0 = scr, *bank1 = scr + SCR_PIXELS;
 
-    // Weave the 512-wide image into the two interleaved 256-wide banks:
-    // even output columns -> bank 0, odd -> bank 1. A pixel is INK when nearer
-    // the ink colour than the paper colour.
+    // The two render colours (both BRIGHT) drive nearest-colour / dithering.
+    byte ic[3], pc[3];
+    indexToRGB(ink, 1, DEF_NORMAL, &ic[0], &ic[1], &ic[2]);
+    indexToRGB(paper, 1, DEF_NORMAL, &pc[0], &pc[1], &pc[2]);
+
+    // Weave the 512-wide image into the two interleaved 256-wide banks: even
+    // output columns -> bank 0, odd -> bank 1, with optional FS error diffusion.
+    memset(gErrHi, 0, sizeof gErrHi);
     for (int y = 0; y < SCR_H; y++)
+    {
+        double (*cur)[3] = gErrHi[y & 1], (*nxt)[3] = gErrHi[(y + 1) & 1];
+        for (int X = 0; X < HIRES_W; X++) for (int c = 0; c < 3; c++) nxt[X][c] = 0;
         for (int X = 0; X < HIRES_W; X++)
         {
             const byte *p = samplePx(px, w, f, X, y);
-            int br, idx = classify(p[0], p[1], p[2], &br);
-            if (colourDist(idx, ink) < colourDist(idx, paper))
+            double t[3]; for (int c = 0; c < 3; c++) t[c] = p[c] + (dither ? cur[X][c] : 0);
+            double di = 0, dp = 0;
+            for (int c = 0; c < 3; c++) { double a = t[c]-ic[c], b = t[c]-pc[c]; di += a*a; dp += b*b; }
+            const byte *chosen = (di <= dp) ? ic : pc;
+            if (di <= dp)
             {
                 byte *bank = (X & 1) ? bank1 : bank0;
                 int col = X >> 1;
                 bank[PIX_OFF(y, col)] |= (0x80 >> (col & 7));
             }
+            if (dither)
+                for (int c = 0; c < 3; c++)
+                {
+                    double e = t[c] - chosen[c];
+                    if (X + 1 < HIRES_W) cur[X+1][c] += e * 7.0/16;
+                    if (X > 0) nxt[X-1][c] += e * 3.0/16;
+                    nxt[X][c] += e * 5.0/16;
+                    if (X + 1 < HIRES_W) nxt[X+1][c] += e * 1.0/16;
+                }
         }
+    }
     // Trailing colour byte = raw port-0xFF value: mode 0x06 (hi-res) in bits
     // 0-2, INK in bits 3-5. Emulators store and re-read exactly this byte.
     scr[TMX_SIZE] = (byte)(0x06 | (ink << 3));
@@ -705,8 +848,8 @@ static void cmdPng2ScrHiRes(const char *in, const char *out)
     stbi_image_free(px);
     writeFile(out, scr, TMX_HIRES);
     free(scr);
-    printf("Wrote %s (%d bytes, Timex hi-res, ink=%d paper=%d)\n",
-           out, TMX_HIRES, ink, paper);
+    printf("Wrote %s (%d bytes, Timex hi-res, ink=%d paper=%d%s)\n",
+           out, TMX_HIRES, ink, paper, dither ? ", dithered" : "");
 }
 
 //~~~~ png2scr: ULAplus quantiser ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~//
@@ -718,32 +861,6 @@ static void cmdPng2ScrHiRes(const char *in, const char *out)
 //   3. re-emit each cell's attribute + bitmap against its assigned palette.
 
 typedef struct { int ink, paper; } CellPair;   // GRB332 register bytes (0..255)
-
-// Two dominant colours of a cell: paper = most frequent, ink = next
-// (ink == paper for a single-colour cell).
-static void findTop2(const int *hist, int *paper, int *ink)
-{
-    int p = 0, i = -1;
-    for (int c = 1; c < 256; c++) if (hist[c] > hist[p]) p = c;
-    for (int c = 0; c < 256; c++)
-        if (c != p && hist[c] > 0 && (i < 0 || hist[c] > hist[i])) i = c;
-    *paper = p; *ink = (i < 0) ? p : i;
-}
-
-// The 8 most frequent register values in a histogram (0-padded), most-used
-// first. Used to reduce a group's colours to the 8 ink / 8 paper slots.
-static void pickTop8(const int *hist, byte *out8)
-{
-    int h[256];
-    for (int c = 0; c < 256; c++) h[c] = hist[c];
-    for (int s = 0; s < 8; s++)
-    {
-        int best = 0, bc = -1;
-        for (int c = 0; c < 256; c++) if (h[c] > bc) { bc = h[c]; best = c; }
-        out8[s] = (byte)(bc > 0 ? best : 0);
-        h[best] = -1;       // don't pick the same value twice
-    }
-}
 
 // Build the 64-entry CLUT and assign each cell a group + ink/paper slot.
 static void ulaQuantise(const CellPair *cells, int n, byte *clut,
@@ -821,13 +938,18 @@ static void ulaQuantise(const CellPair *cells, int n, byte *clut,
             else { int idx = (int)((long)k * (n - 1) / 3); for (int dd = 0; dd < 6; dd++) cen[k][dd] = feat[idx][dd]; }
     }
 
-    // Reduce each group's colours to its 8 ink + 8 paper slots by popularity.
+    // Reduce each group's colours to its 8 ink + 8 paper slots by median-cut
+    // (better tonal coverage than plain popularity, which drops spread colours).
     for (int k = 0; k < 4; k++)
     {
         int ih[256] = {0}, ph[256] = {0};
         for (int i = 0; i < n; i++) if (assign[i] == k) { ih[cells[i].ink]++; ph[cells[i].paper]++; }
-        pickTop8(ih, &clut[k * 16]);
-        pickTop8(ph, &clut[k * 16 + 8]);
+        byte icol[256]; int iwt[256], inc = 0, pnc = 0;
+        byte pcol[256]; int pwt[256];
+        for (int c = 0; c < 256; c++) if (ih[c]) { icol[inc] = (byte)c; iwt[inc++] = ih[c]; }
+        for (int c = 0; c < 256; c++) if (ph[c]) { pcol[pnc] = (byte)c; pwt[pnc++] = ph[c]; }
+        medianCut(icol, iwt, inc, 8, &clut[k * 16]);
+        medianCut(pcol, pwt, pnc, 8, &clut[k * 16 + 8]);
     }
     // Map each cell's colours to the nearest kept slot in its group.
     for (int i = 0; i < n; i++)
@@ -840,20 +962,20 @@ static void ulaQuantise(const CellPair *cells, int n, byte *clut,
     free(feat); free(assign);
 }
 
-// Emit the bitmap byte for one 8-pixel strip against a chosen ink/paper colour.
-static byte ulaStripBits(const byte *px, int w, int f, int x0, int y, byte inkCol, byte paperCol)
+// Decode each cell's chosen palette entries to RGB so the dithered emitter can
+// pick ink-or-paper per pixel against the real colours.
+static void ulaCellRGB(const byte *clut, const byte *grp, const byte *ii,
+                       const byte *pp, int n, byte *cellInk, byte *cellPaper)
 {
-    int bits = 0;
-    for (int pxl = 0; pxl < 8; pxl++)
+    for (int i = 0; i < n; i++)
     {
-        const byte *p = samplePx(px, w, f, x0 + pxl, y);
-        byte e = rgbToPlus(p[0], p[1], p[2]);
-        if (plusDist(e, inkCol) < plusDist(e, paperCol)) bits |= (0x80 >> pxl);
+        int g = grp[i];
+        plusToRGB(clut[g*16 + ii[i]],     &cellInk[i*3],   &cellInk[i*3+1],   &cellInk[i*3+2]);
+        plusToRGB(clut[g*16 + 8 + pp[i]], &cellPaper[i*3], &cellPaper[i*3+1], &cellPaper[i*3+2]);
     }
-    return (byte)bits;
 }
 
-static void cmdPng2ScrUlaStd(const char *in, const char *out)
+static void cmdPng2ScrUlaStd(const char *in, const char *out, int dither)
 {
     int w, h, f;
     byte *px = loadPngRGB(in, SCR_W, &w, &h, &f);
@@ -861,42 +983,31 @@ static void cmdPng2ScrUlaStd(const char *in, const char *out)
     for (int cy = 0; cy < 24; cy++)
         for (int cx = 0; cx < 32; cx++)
         {
-            int hist[256]; memset(hist, 0, sizeof hist);
-            for (int py = 0; py < 8; py++)
-                for (int pxl = 0; pxl < 8; pxl++)
-                {
-                    const byte *p = samplePx(px, w, f, cx * 8 + pxl, cy * 8 + py);
-                    hist[rgbToPlus(p[0], p[1], p[2])]++;
-                }
-            int paper, ink; findTop2(hist, &paper, &ink);
+            int ink, paper;
+            cellTwoColours(px, w, f, cx * 8, cy * 8, 8, 8, &ink, &paper);
             cells[cy * 32 + cx].ink = ink; cells[cy * 32 + cx].paper = paper;
         }
 
     byte clut[PAL_SIZE], grp[768], ii[768], pp[768];
     ulaQuantise(cells, 768, clut, grp, ii, pp);
 
+    byte cellInk[768 * 3], cellPaper[768 * 3];
+    ulaCellRGB(clut, grp, ii, pp, 768, cellInk, cellPaper);
+
     byte *scr = (byte *)calloc(SCR_SIZE + PAL_SIZE, 1);
     if (!scr) die("Memory allocation error", NULL);
-    for (int cy = 0; cy < 24; cy++)
-        for (int cx = 0; cx < 32; cx++)
-        {
-            int idx = cy * 32 + cx, g = grp[idx];
-            byte inkCol = clut[g * 16 + ii[idx]], paperCol = clut[g * 16 + 8 + pp[idx]];
-            scr[SCR_PIXELS + idx] = (byte)((g << 6) | (pp[idx] << 3) | ii[idx]);
-            for (int py = 0; py < 8; py++)
-            {
-                int y = cy * 8 + py;
-                scr[PIX_OFF(y, cx * 8)] = ulaStripBits(px, w, f, cx * 8, y, inkCol, paperCol);
-            }
-        }
+    for (int idx = 0; idx < 768; idx++)
+        scr[SCR_PIXELS + idx] = (byte)((grp[idx] << 6) | (pp[idx] << 3) | ii[idx]);
+    emitBitmap256(px, w, f, cellInk, cellPaper, 8, scr, dither);
     memcpy(scr + SCR_SIZE, clut, PAL_SIZE);
     stbi_image_free(px);
     writeFile(out, scr, SCR_SIZE + PAL_SIZE);
     free(scr);
-    printf("Wrote %s (%d bytes, standard + ULAplus)\n", out, SCR_SIZE + PAL_SIZE);
+    printf("Wrote %s (%d bytes, standard + ULAplus%s)\n",
+           out, SCR_SIZE + PAL_SIZE, dither ? ", dithered" : "");
 }
 
-static void cmdPng2ScrUlaHiColour(const char *in, const char *out)
+static void cmdPng2ScrUlaHiColour(const char *in, const char *out, int dither)
 {
     int w, h, f;
     byte *px = loadPngRGB(in, SCR_W, &w, &h, &f);
@@ -906,13 +1017,8 @@ static void cmdPng2ScrUlaHiColour(const char *in, const char *out)
     for (int y = 0; y < SCR_H; y++)
         for (int cx = 0; cx < 32; cx++)
         {
-            int hist[256]; memset(hist, 0, sizeof hist);
-            for (int pxl = 0; pxl < 8; pxl++)
-            {
-                const byte *p = samplePx(px, w, f, cx * 8 + pxl, y);
-                hist[rgbToPlus(p[0], p[1], p[2])]++;
-            }
-            int paper, ink; findTop2(hist, &paper, &ink);
+            int ink, paper;
+            cellTwoColours(px, w, f, cx * 8, y, 8, 1, &ink, &paper);
             cells[y * 32 + cx].ink = ink; cells[y * 32 + cx].paper = paper;
         }
 
@@ -921,22 +1027,27 @@ static void cmdPng2ScrUlaHiColour(const char *in, const char *out)
     if (!grp || !ii || !pp) die("Memory allocation error", NULL);
     ulaQuantise(cells, n, clut, grp, ii, pp);
 
+    byte *cellInk = (byte *)malloc((size_t)n * 3), *cellPaper = (byte *)malloc((size_t)n * 3);
+    if (!cellInk || !cellPaper) die("Memory allocation error", NULL);
+    ulaCellRGB(clut, grp, ii, pp, n, cellInk, cellPaper);
+
     byte *scr = (byte *)calloc(TMX_SIZE + PAL_SIZE, 1);
     if (!scr) die("Memory allocation error", NULL);
-    byte *bmp = scr, *att = scr + SCR_PIXELS;
+    byte *att = scr + SCR_PIXELS;
     for (int y = 0; y < SCR_H; y++)
         for (int cx = 0; cx < 32; cx++)
         {
-            int idx = y * 32 + cx, g = grp[idx], o = PIX_OFF(y, cx * 8);
-            byte inkCol = clut[g * 16 + ii[idx]], paperCol = clut[g * 16 + 8 + pp[idx]];
-            att[o] = (byte)((g << 6) | (pp[idx] << 3) | ii[idx]);
-            bmp[o] = ulaStripBits(px, w, f, cx * 8, y, inkCol, paperCol);
+            int idx = y * 32 + cx;
+            att[PIX_OFF(y, cx * 8)] = (byte)((grp[idx] << 6) | (pp[idx] << 3) | ii[idx]);
         }
+    emitBitmap256(px, w, f, cellInk, cellPaper, 1, scr, dither);
     memcpy(scr + TMX_SIZE, clut, PAL_SIZE);
+    free(cellInk); free(cellPaper);
     stbi_image_free(px);
     writeFile(out, scr, TMX_SIZE + PAL_SIZE);
     free(scr); free(cells); free(grp); free(ii); free(pp);
-    printf("Wrote %s (%d bytes, Timex hi-colour + ULAplus)\n", out, TMX_SIZE + PAL_SIZE);
+    printf("Wrote %s (%d bytes, Timex hi-colour + ULAplus%s)\n",
+           out, TMX_SIZE + PAL_SIZE, dither ? ", dithered" : "");
 }
 
 //~~~~ scr2gif (animate the FLASH attribute) ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~//
@@ -1284,7 +1395,7 @@ int main(int argc, char **argv)
     enum Command cmd = cmNone;
     enum Mode mode = mStd;
     const char *fileIn = NULL, *fileOut = NULL;
-    int normal = DEF_NORMAL, scale = 1, delayCs = 32, ulaplus = 0;
+    int normal = DEF_NORMAL, scale = 1, delayCs = 32, ulaplus = 0, dither = 0;
 
     for (int i = 1; i < argc; i++)
     {
@@ -1294,6 +1405,7 @@ int main(int argc, char **argv)
         else if (strcmp(a, "--scale") == 0 && i + 1 < argc) { scale = atoi(argv[++i]); if (scale < 1) scale = 1; }
         else if (strcmp(a, "--delay") == 0 && i + 1 < argc) { delayCs = atoi(argv[++i]); if (delayCs < 1) delayCs = 1; }
         else if (strcmp(a, "--ulaplus") == 0) ulaplus = 1;
+        else if (strcmp(a, "--dither") == 0) dither = 1;
         else if (strcmp(a, "--palette") == 0 && i + 1 < argc)
         {
             const char *p = argv[++i];
@@ -1328,14 +1440,14 @@ int main(int argc, char **argv)
             if (!fileOut) die("Missing output .scr file", NULL);
             if (ulaplus)
             {
-                if      (mode == mStd)      cmdPng2ScrUlaStd(fileIn, fileOut);
-                else if (mode == mHiColour) cmdPng2ScrUlaHiColour(fileIn, fileOut);
+                if      (mode == mStd)      cmdPng2ScrUlaStd(fileIn, fileOut, dither);
+                else if (mode == mHiColour) cmdPng2ScrUlaHiColour(fileIn, fileOut, dither);
                 else die("hi-res + ULAplus output is not supported "
                          "(the palette mapping is under-specified)", NULL);
             }
-            else if (mode == mStd)      cmdPng2ScrStd(fileIn, fileOut);
-            else if (mode == mHiColour) cmdPng2ScrHiColour(fileIn, fileOut);
-            else                        cmdPng2ScrHiRes(fileIn, fileOut);
+            else if (mode == mStd)      cmdPng2ScrStd(fileIn, fileOut, dither);
+            else if (mode == mHiColour) cmdPng2ScrHiColour(fileIn, fileOut, dither);
+            else                        cmdPng2ScrHiRes(fileIn, fileOut, dither);
             break;
         case cmScr2Png:
             if (!fileOut) die("Missing output .png file", NULL);

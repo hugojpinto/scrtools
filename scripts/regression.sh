@@ -184,6 +184,18 @@ sys.exit(0 if n>15 else 1)
 PY
 [ $? -eq 0 ] && ok "ULAplus quantiser uses more than 15 colours" || bad "ULAplus quantiser colours"
 
+# --- Test 11: --dither changes the bitmap and stays valid ---------------
+# On a smooth gradient, dithering must alter the bitmap (vs flat fill) while
+# producing a well-formed screen of the right size.
+"$BIN" png2scr "$TMP/grad.png" "$TMP/g_nd.scr" >/dev/null
+"$BIN" png2scr --dither "$TMP/grad.png" "$TMP/g_d.scr" >/dev/null
+[ "$(wc -c < "$TMP/g_d.scr")" -eq 6912 ] && ok "dithered std is 6912 bytes" || bad "dithered std size"
+cmp -s "$TMP/g_nd.scr" "$TMP/g_d.scr" \
+    && bad "dither changed the output" || ok "dither changes the bitmap vs flat fill"
+# ULAplus + dither must also yield a valid 6976-byte screen.
+"$BIN" png2scr --ulaplus --dither "$TMP/grad.png" "$TMP/g_ud.scr" >/dev/null
+[ "$(wc -c < "$TMP/g_ud.scr")" -eq 6976 ] && ok "dithered ULAplus is 6976 bytes" || bad "dithered ULAplus size"
+
 echo
 echo "Passed: $pass  Failed: $fail"
 [ "$fail" -eq 0 ]

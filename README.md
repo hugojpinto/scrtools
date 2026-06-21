@@ -33,6 +33,8 @@ Options:
                      0-255 (default 215 = 0xD7). Bright stays 255.
     --palette <p>    Named level preset: standard (215, default),
                      classic (205), emulator (192).
+    --dither         png2scr: Floyd-Steinberg dither the bitmap between
+                     each cell's two colours (helps shaded images).
     --scale <n>      Upscale scr2png / scr2gif output by factor n.
     --delay <cs>     FLASH frame delay for scr2gif, centiseconds
                      (default 32 = the hardware ~1.56 Hz rate).
@@ -42,6 +44,7 @@ Examples:
     scrtools png2scr --mode hires logo512.png logo.scr
     scrtools png2scr --mode hicolour pic.png pic.scr
     scrtools png2scr --ulaplus photo.png photo.scr
+    scrtools png2scr --ulaplus --dither photo.png photo.scr
     scrtools scr2png demo.scr demo.png
     scrtools scr2png --palette emulator demo.scr demo.png
     scrtools scr2gif --scale 2 demo.scr demo.gif
@@ -139,7 +142,9 @@ with the `0xBF` convention, for example.
   (tolerant of the exact normal level used), then resolves ink/paper/bright per
   cell (8×8 for std, 8×1 for hi-colour) or a single global pair (hi-res). A
   faithful render converts losslessly; a clashing cell snaps to its two dominant
-  colours rather than being rejected.
+  colours rather than being rejected. `--dither` adds Floyd-Steinberg error
+  diffusion when choosing ink-vs-paper per pixel, trading hard edges for smooth
+  shading — most useful on gradients and photos.
 * The rendered image is the canonical truth: `png → scr → png` is
   **pixel-identical** (at a matching `--level`), and `png2scr` output is a stable
   **fixed point**. On real Timex hi-res samples, `scr → png → scr` is even
@@ -150,17 +155,18 @@ with the `0xBF` convention, for example.
   swap every 320 ms, the hardware rate). GIF's indexed colour is a perfect fit
   for the 16-entry Spectrum palette (64 entries for ULAplus). Screens with no
   FLASH cells — including all ULAplus screens — produce a single static frame.
-* **png2scr --ulaplus** is a constrained quantiser: it snaps each pixel to the
-  GRB-332 gamut, takes the two dominant colours per cell, then fits all cells
-  into four 16-entry CLUT groups (a single-group lossless fast path, falling back
-  to k-means + per-group popularity reduction). Images that already fit ULAplus
-  constraints round-trip losslessly; richer images are quantised to ≤64 colours.
+* **png2scr --ulaplus** is a constrained quantiser. It picks each cell's two
+  colours by **2-means** in RGB (better than most-frequent for shaded cells),
+  snaps to the GRB-332 gamut, then fits all cells into four 16-entry CLUT groups:
+  a single-group lossless fast path, falling back to **k-means** group assignment
+  with **median-cut** building each group's 8 ink / 8 paper slots. Images that
+  already fit ULAplus constraints round-trip losslessly; richer images quantise
+  to ≤64 colours, and `--dither` smooths the result.
 
 ## Roadmap
 
 * Direct ingestion from TAP `SCREEN$` blocks (pairs with `taput export-png`).
-* Higher-quality ULAplus quantisation (median-cut / error diffusion) and
-  hi-res + ULAplus colour mapping if a de-facto standard emerges.
+* Hi-res + ULAplus colour mapping, if a de-facto standard emerges.
 
 ## Building
 
