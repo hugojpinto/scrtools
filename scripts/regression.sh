@@ -119,6 +119,71 @@ PY
 [ $? -eq 0 ] && ok "scr2gif emits a 2-frame animation for flashing screens" \
     || bad "scr2gif animation"
 
+# --- Test 7: ULAplus standard, lossless fast path (6976 bytes) ----------
+# Build a 256x192 image using <=8 GRB332-exact colours, <=2 per 8x8 cell, so
+# the quantiser's single-group fast path applies and the round-trip is lossless.
+python3 - "$TMP/ula.png" <<'PY'
+import sys
+from PIL import Image
+P=[(182,0,0),(0,182,0),(0,0,182),(182,182,0),
+   (182,0,182),(0,182,182),(182,182,182),(0,0,0)]   # all GRB332-exact
+im=Image.new("RGB",(256,192)); px=im.load()
+for cy in range(24):
+    for cx in range(32):
+        a=P[(cx)%8]; b=P[(cy)%8]                       # two colours per cell
+        for y in range(cy*8,cy*8+8):
+            for x in range(cx*8,cx*8+8):
+                px[x,y]= a if ((x+y)//2)%2 else b
+im.save(sys.argv[1])
+PY
+"$BIN" png2scr --ulaplus "$TMP/ula.png" "$TMP/ula.scr" >/dev/null
+[ "$(wc -c < "$TMP/ula.scr")" -eq 6976 ] && ok "ULAplus std is 6976 bytes" || bad "ULAplus std size"
+"$BIN" info "$TMP/ula.scr" | grep -q "ULAplus 64-colour palette" \
+    && ok "info recognises ULAplus" || bad "ULAplus detection"
+"$BIN" scr2png "$TMP/ula.scr" "$TMP/ula_a.png" >/dev/null
+"$BIN" png2scr --ulaplus "$TMP/ula_a.png" "$TMP/ula2.scr" >/dev/null
+"$BIN" scr2png "$TMP/ula2.scr" "$TMP/ula_b.png" >/dev/null
+cmp -s "$TMP/ula_a.png" "$TMP/ula_b.png" \
+    && ok "ULAplus lossless png->scr->png is pixel-identical" || bad "ULAplus lossless round-trip"
+
+# --- Test 8: ULAplus hi-colour (12352 bytes) ----------------------------
+"$BIN" png2scr --mode hicolour --ulaplus "$TMP/ula.png" "$TMP/ulahc.scr" >/dev/null
+[ "$(wc -c < "$TMP/ulahc.scr")" -eq 12352 ] && ok "ULAplus hi-colour is 12352 bytes" || bad "ULAplus hi-colour size"
+"$BIN" info "$TMP/ulahc.scr" | grep -q "hi-colour.*ULAplus" \
+    && ok "info recognises ULAplus hi-colour" || bad "ULAplus hi-colour detection"
+
+# --- Test 9: ULAplus scr2gif is a static 64-colour GIF ------------------
+"$BIN" scr2gif "$TMP/ula.scr" "$TMP/ula.gif" >/dev/null
+python3 - "$TMP/ula.gif" <<'PY'
+import sys
+from PIL import Image
+im=Image.open(sys.argv[1])
+sys.exit(0 if getattr(im,"n_frames",1)==1 else 1)   # ULAplus never flashes
+PY
+[ $? -eq 0 ] && ok "ULAplus scr2gif is a single static frame" || bad "ULAplus gif frames"
+
+# --- Test 10: quantiser produces >15 colours from a truecolour image ----
+python3 - "$TMP/grad.png" <<'PY'
+import sys
+from PIL import Image
+im=Image.new("RGB",(256,192)); px=im.load()
+for y in range(192):
+    for x in range(256): px[x,y]=(x,y,(x*y)//256%256)
+im.save(sys.argv[1])
+PY
+"$BIN" png2scr --ulaplus "$TMP/grad.png" "$TMP/grad.scr" >/dev/null
+"$BIN" scr2png "$TMP/grad.scr" "$TMP/grad_out.png" >/dev/null
+python3 - "$TMP/grad_out.png" <<'PY'
+import sys, warnings
+warnings.filterwarnings("ignore")
+from PIL import Image
+im=Image.open(sys.argv[1]).convert("RGB")
+n=len(im.getcolors(maxcolors=70) or [])
+print("quantiser colours:", n)
+sys.exit(0 if n>15 else 1)
+PY
+[ $? -eq 0 ] && ok "ULAplus quantiser uses more than 15 colours" || bad "ULAplus quantiser colours"
+
 echo
 echo "Passed: $pass  Failed: $fail"
 [ "$fail" -eq 0 ]

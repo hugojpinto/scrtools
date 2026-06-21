@@ -14,12 +14,12 @@ vendored, public-domain `stb_image.h`, and PNG/GIF encoding is hand-rolled
 scrtools command [options] FileIn [FileOut]
 
 Commands:
-    png2scr          Convert a PNG to a .scr (see --mode).
+    png2scr          Convert a PNG to a .scr (see --mode / --ulaplus).
     scr2png          Render a .scr to a PNG. The screen mode (standard,
-                     hi-colour, hi-res) is detected from the file size.
+                     hi-colour, hi-res, ULAplus) is detected from the size.
     scr2gif          Render a .scr to a GIF, animating the FLASH
                      attribute as a 2-frame loop (static if no FLASH).
-    info             Show a summary of a .scr (mode, size, colours).
+    info             Show a summary of a .scr (mode, size, colours/palette).
 
 Options:
     -h, --help       Display this help and exit.
@@ -27,6 +27,8 @@ Options:
                        std        256x192, 8x8 attrs  -> 6912 bytes
                        hicolour   256x192, 8x1 attrs  -> 12288 bytes
                        hires      512x192 mono+colour -> 12289 bytes
+    --ulaplus        png2scr: emit a ULAplus 64-colour screen (+64 palette
+                     bytes -> 6976 / 12352). std and hicolour only.
     --level <n>      Normal (non-bright) colour level for rendering,
                      0-255 (default 215 = 0xD7). Bright stays 255.
     --palette <p>    Named level preset: standard (215, default),
@@ -39,6 +41,7 @@ Examples:
     scrtools png2scr factory.png factory.scr
     scrtools png2scr --mode hires logo512.png logo.scr
     scrtools png2scr --mode hicolour pic.png pic.scr
+    scrtools png2scr --ulaplus photo.png photo.scr
     scrtools scr2png demo.scr demo.png
     scrtools scr2png --palette emulator demo.scr demo.png
     scrtools scr2gif --scale 2 demo.scr demo.gif
@@ -53,8 +56,11 @@ convention used by ZX-Paintbrush and the wider toolchain):
 | Size  | Mode             | Layout |
 |-------|------------------|--------|
 | 6912  | Standard         | 6144 bitmap + 768 attrs (32×24 cells of 8×8) |
+| 6976  | Standard + ULAplus | 6912 + 64 palette registers |
 | 12288 | Timex hi-colour  | 6144 bitmap + 6144 attrs (8×1: one attr per scanline) |
+| 12352 | hi-colour + ULAplus | 12288 + 64 palette registers |
 | 12289 | Timex hi-res     | two 6144 banks (512×192 mono) + 1 colour byte |
+| 12353 | hi-res + ULAplus | 12289 + 64 palette registers |
 
 ### Standard
 
@@ -89,6 +95,27 @@ There is a single global colour for the whole screen, stored in a trailing byte
 both `BRIGHT`. The eight possible pairs are high-contrast complements (e.g.
 `0x36` → yellow ink on blue paper).
 
+### ULAplus (64-colour palette)
+
+Any of the three modes can carry a **ULAplus** palette: 64 registers appended to
+the end of the file (so 6976 / 12352 / 12353 bytes). Each register is `GGGRRRBB`
+(3-bit green, 3-bit red, 2-bit blue → 256 possible colours). When a palette is
+present the attribute byte's top two bits stop meaning FLASH/BRIGHT and instead
+select one of **four 16-entry CLUT groups** (8 ink + 8 paper):
+
+```
+ink_index   = group*16 + INK          (group = FLASH*2 + BRIGHT)
+paper_index = group*16 + 8 + PAPER
+```
+
+A cell still shows only two colours, but each can be any of the 64 — provided
+both come from the same group. There is no hardware FLASH in palette mode (the
+bit is repurposed), so `scr2gif` renders ULAplus screens as a single frame.
+`scr2png`/`scr2gif`/`info` apply the embedded palette automatically (the
+`--level`/`--palette` options don't affect ULAplus output). Hi-res + ULAplus
+(12353) is read and preserved, but its palette mapping is under-specified in the
+wild, so hi-res is rendered with its fixed colour pair.
+
 ## The palette
 
 The Spectrum is an analogue machine; "normal" brightness is ≈85% of the bright
@@ -121,13 +148,19 @@ with the `0xBF` convention, for example.
   cell never paints).
 * **scr2gif** animates the `FLASH` attribute as a looping 2-frame GIF (ink/paper
   swap every 320 ms, the hardware rate). GIF's indexed colour is a perfect fit
-  for the 16-entry Spectrum palette. Screens with no FLASH cells produce a
-  single static frame.
+  for the 16-entry Spectrum palette (64 entries for ULAplus). Screens with no
+  FLASH cells — including all ULAplus screens — produce a single static frame.
+* **png2scr --ulaplus** is a constrained quantiser: it snaps each pixel to the
+  GRB-332 gamut, takes the two dominant colours per cell, then fits all cells
+  into four 16-entry CLUT groups (a single-group lossless fast path, falling back
+  to k-means + per-group popularity reduction). Images that already fit ULAplus
+  constraints round-trip losslessly; richer images are quantised to ≤64 colours.
 
 ## Roadmap
 
 * Direct ingestion from TAP `SCREEN$` blocks (pairs with `taput export-png`).
-* ULAplus 64-register screens (6976 / 12352 / 12353 byte variants).
+* Higher-quality ULAplus quantisation (median-cut / error diffusion) and
+  hi-res + ULAplus colour mapping if a de-facto standard emerges.
 
 ## Building
 

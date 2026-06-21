@@ -75,6 +75,7 @@ typedef unsigned char byte;
 #define TMX_SIZE    (SCR_PIXELS * 2)           // 12288, hi-colour / hi-res
 #define TMX_HIRES   (TMX_SIZE + 1)             // 12289, hi-res with colour byte
 #define HIRES_W     512
+#define PAL_SIZE    64                         // ULAplus appends 64 GRB332 regs
 
 // ATTR_AT: byte index (0..767) of the attribute cell covering pixel (x,y).
 //   Cells are 8x8, laid out left-to-right, top-to-bottom: 32 per row, 24 rows.
@@ -124,6 +125,9 @@ static const char *Help =
     "                       std        256x192, 8x8 attrs  -> 6912 bytes\n"
     "                       hicolour   256x192, 8x1 attrs  -> 12288 bytes\n"
     "                       hires      512x192 mono+colour -> 12289 bytes\n"
+    "    --ulaplus        png2scr: emit a ULAplus 64-colour screen (adds 64\n"
+    "                     palette bytes -> 6976 / 12352). std and hicolour only.\n"
+    "                     scr2png/scr2gif/info auto-detect ULAplus screens.\n"
     "    --level <n>      Normal (non-bright) colour level for rendering,\n"
     "                     0-255 (default 215 = 0xD7). Bright stays 255.\n"
     "    --palette <p>    Named level preset: standard (215, default),\n"
@@ -136,6 +140,7 @@ static const char *Help =
     "    scrtools png2scr factory.png factory.scr\n"
     "    scrtools png2scr --mode hires logo512.png logo.scr\n"
     "    scrtools png2scr --mode hicolour pic.png pic.scr\n"
+    "    scrtools png2scr --ulaplus photo.png photo.scr\n"
     "    scrtools scr2png factory.scr factory.png\n"
     "    scrtools scr2png --palette emulator factory.scr factory.png\n"
     "    scrtools scr2gif --scale 2 demo.scr demo.gif\n"
@@ -322,6 +327,102 @@ static int classify(byte r, byte g, byte b, int *bright)
 // to whichever of a cell's two chosen colours it is nearest).
 static int colourDist(int a, int b) { return __builtin_popcount(a ^ b); }
 
+//~~~~ ULAplus (GRB332 64-colour palette) ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~//
+// A ULAplus screen appends 64 palette registers, one byte each, in the layout
+// GGGRRRBB: bits 7-5 green, 4-2 red, 1-0 blue. A 3-bit channel expands to 8
+// bits by bit-replication (hmlhmlhm); the 2-bit blue first gains a synthesised
+// 3rd low bit equal to (b1 | b0), per the official spec, then replicates too.
+//
+// When a palette is present FLASH and BRIGHT stop meaning flash/bright: together
+// they select one of four 16-entry CLUT groups. Within a group, INK picks slots
+// 0-7 and PAPER slots 8-15:
+//     ink_index   = (FLASH<<5) | (BRIGHT<<4) |     INK         (group*16 + ink)
+//     paper_index = (FLASH<<5) | (BRIGHT<<4) | 8 | PAPER       (group*16 + 8 + paper)
+// A cell still shows only two colours, but each may be any of the 64 entries
+// (provided both come from the same group). There is no hardware FLASH in this
+// mode (the bit is repurposed).
+
+static byte exp3(int x) { return (byte)((x << 5) | (x << 2) | (x >> 1)); }
+
+// Decode one GRB332 register to 8-bit RGB.
+static void plusToRGB(byte e, byte *r, byte *g, byte *b)
+{
+    int g3 = (e >> 5) & 7, r3 = (e >> 2) & 7;
+    int b1 = (e >> 1) & 1, b0 = e & 1;
+    int b3 = (b1 << 2) | (b0 << 1) | (b1 | b0);
+    *r = exp3(r3); *g = exp3(g3); *b = exp3(b3);
+}
+
+// Nearest representable 3-bit channel level for an 8-bit value.
+static int nearest3(int v)
+{
+    int best = 0, bd = 1 << 30;
+    for (int i = 0; i < 8; i++) { int d = exp3(i) - v; if (d < 0) d = -d; if (d < bd) { bd = d; best = i; } }
+    return best;
+}
+
+// Snap an 8-bit RGB triple to the nearest GRB332 register byte.
+static byte rgbToPlus(int r, int g, int b)
+{
+    int g3 = nearest3(g), r3 = nearest3(r), bestB = 0, bd = 1 << 30;
+    for (int b2 = 0; b2 < 4; b2++)
+    {
+        int b1 = (b2 >> 1) & 1, b0 = b2 & 1;
+        int lvl = exp3((b1 << 2) | (b0 << 1) | (b1 | b0));
+        int d = lvl - b; if (d < 0) d = -d;
+        if (d < bd) { bd = d; bestB = b2; }
+    }
+    return (byte)((g3 << 5) | (r3 << 2) | bestB);
+}
+
+// Squared RGB distance between two GRB332 registers (quantiser metric).
+static int plusDist(byte a, byte b)
+{
+    byte ra, ga, ba, rb, gb, bb;
+    plusToRGB(a, &ra, &ga, &ba); plusToRGB(b, &rb, &gb, &bb);
+    int dr = ra - rb, dg = ga - gb, db = ba - bb;
+    return dr * dr + dg * dg + db * db;
+}
+
+// Detected screen geometry plus whether a 64-byte ULAplus palette is appended.
+typedef struct { enum Mode mode; int palette; int valid; } Detected;
+static Detected detect(size_t len)
+{
+    Detected d = { mStd, 0, 1 };
+    switch (len)
+    {
+        case SCR_SIZE:            d.mode = mStd;      d.palette = 0; break;  // 6912
+        case SCR_SIZE + PAL_SIZE: d.mode = mStd;      d.palette = 1; break;  // 6976
+        case TMX_SIZE:            d.mode = mHiColour; d.palette = 0; break;  // 12288
+        case TMX_SIZE + PAL_SIZE: d.mode = mHiColour; d.palette = 1; break;  // 12352
+        case TMX_HIRES:           d.mode = mHiRes;    d.palette = 0; break;  // 12289
+        case TMX_HIRES + PAL_SIZE:d.mode = mHiRes;    d.palette = 1; break;  // 12353
+        default: d.valid = 0; break;
+    }
+    return d;
+}
+
+// Resolve (attribute, pixel-on) to RGB. With a ULAplus CLUT present the FLASH/
+// BRIGHT bits choose a group; otherwise the classic fixed palette is used.
+static void resolveRGB(byte attr, int on, const byte *clut, int normal,
+                       byte *r, byte *g, byte *b)
+{
+    if (clut)
+    {
+        int grp = (attr >> 6) & 3;
+        int idx = on ? (grp * 16 + (attr & 7)) : (grp * 16 + 8 + ((attr >> 3) & 7));
+        plusToRGB(clut[idx], r, g, b);
+    }
+    else
+    {
+        int colour = on ? (attr & 7) : ((attr >> 3) & 7);
+        indexToRGB(colour, attr & 0x40, normal, r, g, b);
+    }
+}
+
+#define BAD_SIZE_MSG "Unrecognised .scr size " \
+    "(need 6912/6976, 12288/12352 or 12289/12353):"
+
 //~~~~ scr2png (mode auto-detected by file size) ~~~~~~~~~~~~~~~~~~~~~~~~~~~//
 
 // Splat one logical pixel into a scale x scale block of the output buffer.
@@ -339,14 +440,20 @@ static void cmdScr2Png(const char *in, const char *out, int normal, int scale)
 {
     size_t len;
     byte *scr = readFile(in, &len);
+    Detected d = detect(len);
+    if (!d.valid) { free(scr); die(BAD_SIZE_MSG, in); }
 
-    // Pick the source width/height from the detected mode, allocate the output.
-    int srcW = (len == TMX_HIRES) ? HIRES_W : SCR_W;
+    // ULAplus CLUT is the last 64 bytes. It is well-defined for the attribute
+    // modes; for hi-res it is under-specified, so we render hi-res with its
+    // fixed colour pair and leave the palette unapplied (but preserved on disk).
+    const byte *clut = (d.palette && d.mode != mHiRes) ? scr + len - PAL_SIZE : NULL;
+
+    int srcW = (d.mode == mHiRes) ? HIRES_W : SCR_W;
     int W = srcW * scale, H = SCR_H * scale;
     byte *rgb = (byte *)malloc((size_t)W * H * 3);
     if (!rgb) die("Memory allocation error", NULL);
 
-    if (len == SCR_SIZE)
+    if (d.mode == mStd)
     {
         // -- Standard: per-pixel bit + per-8x8-cell attribute. --
         for (int y = 0; y < SCR_H; y++)
@@ -355,13 +462,12 @@ static void cmdScr2Png(const char *in, const char *out, int normal, int scale)
                 // 8 pixels per byte, MSB-first: column x uses bit (7 - x%8).
                 int on = (scr[PIX_OFF(y, x)] >> (7 - (x & 7))) & 1;
                 byte attr = scr[SCR_PIXELS + ATTR_AT(y, x)];
-                int colour = on ? (attr & 7) : ((attr >> 3) & 7);   // INK : PAPER
                 byte r, g, b;
-                indexToRGB(colour, attr & 0x40, normal, &r, &g, &b);
+                resolveRGB(attr, on, clut, normal, &r, &g, &b);
                 putPixel(rgb, W, x, y, scale, r, g, b);
             }
     }
-    else if (len == TMX_SIZE)
+    else if (d.mode == mHiColour)
     {
         // -- Timex hi-colour: bitmap in block 1, 8x1 attributes in block 2 at
         //    the SAME interleaved offset, so attr(x,y) == block2[PIX_OFF]. --
@@ -371,14 +477,12 @@ static void cmdScr2Png(const char *in, const char *out, int normal, int scale)
             {
                 int o = PIX_OFF(y, x);
                 int on = (bmp[o] >> (7 - (x & 7))) & 1;
-                byte attr = att[o];
-                int colour = on ? (attr & 7) : ((attr >> 3) & 7);
                 byte r, g, b;
-                indexToRGB(colour, attr & 0x40, normal, &r, &g, &b);
+                resolveRGB(att[o], on, clut, normal, &r, &g, &b);
                 putPixel(rgb, W, x, y, scale, r, g, b);
             }
     }
-    else if (len == TMX_HIRES || len == TMX_SIZE + 0 /* never */)
+    else
     {
         // -- Timex hi-res: 512x192 mono, even cols from block 1, odd from
         //    block 2. Colour is global: bits 3-5 of the trailing port byte are
@@ -397,16 +501,11 @@ static void cmdScr2Png(const char *in, const char *out, int normal, int scale)
                 putPixel(rgb, W, X, y, scale, r, g, b);
             }
     }
-    else
-    {
-        free(rgb); free(scr);
-        die("Unrecognised .scr size (need 6912, 12288 or 12289):", in);
-    }
 
     writeRgbPng(out, rgb, W, H);
     free(rgb);
     free(scr);
-    printf("Wrote %s (%dx%d)\n", out, W, H);
+    printf("Wrote %s (%dx%d%s)\n", out, W, H, clut ? ", ULAplus palette" : "");
 }
 
 //~~~~ png2scr helpers ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~//
@@ -610,6 +709,236 @@ static void cmdPng2ScrHiRes(const char *in, const char *out)
            out, TMX_HIRES, ink, paper);
 }
 
+//~~~~ png2scr: ULAplus quantiser ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~//
+// Turning a truecolour PNG into a ULAplus screen is a constrained quantisation:
+// each cell still shows only two colours, but they may be any of 64 — provided
+// both come from the SAME 16-entry group (8 ink + 8 paper). The pipeline is:
+//   1. per cell, snap pixels to GRB332 and take the two dominant colours;
+//   2. fit those (ink,paper) pairs into 4 groups and build the 64-reg CLUT;
+//   3. re-emit each cell's attribute + bitmap against its assigned palette.
+
+typedef struct { int ink, paper; } CellPair;   // GRB332 register bytes (0..255)
+
+// Two dominant colours of a cell: paper = most frequent, ink = next
+// (ink == paper for a single-colour cell).
+static void findTop2(const int *hist, int *paper, int *ink)
+{
+    int p = 0, i = -1;
+    for (int c = 1; c < 256; c++) if (hist[c] > hist[p]) p = c;
+    for (int c = 0; c < 256; c++)
+        if (c != p && hist[c] > 0 && (i < 0 || hist[c] > hist[i])) i = c;
+    *paper = p; *ink = (i < 0) ? p : i;
+}
+
+// The 8 most frequent register values in a histogram (0-padded), most-used
+// first. Used to reduce a group's colours to the 8 ink / 8 paper slots.
+static void pickTop8(const int *hist, byte *out8)
+{
+    int h[256];
+    for (int c = 0; c < 256; c++) h[c] = hist[c];
+    for (int s = 0; s < 8; s++)
+    {
+        int best = 0, bc = -1;
+        for (int c = 0; c < 256; c++) if (h[c] > bc) { bc = h[c]; best = c; }
+        out8[s] = (byte)(bc > 0 ? best : 0);
+        h[best] = -1;       // don't pick the same value twice
+    }
+}
+
+// Build the 64-entry CLUT and assign each cell a group + ink/paper slot.
+static void ulaQuantise(const CellPair *cells, int n, byte *clut,
+                        byte *outGroup, byte *outInk, byte *outPaper)
+{
+    memset(clut, 0, PAL_SIZE);
+
+    // --- Fast path: if the whole image needs <=8 ink and <=8 paper colours it
+    //     all fits one group and the encode is lossless. ---
+    int inkList[8], paperList[8], ni = 0, np = 0, fits = 1;
+    for (int i = 0; i < n; i++)
+    {
+        int e = cells[i].ink, found = 0;
+        for (int k = 0; k < ni; k++) if (inkList[k] == e) { found = 1; break; }
+        if (!found) { if (ni == 8) { fits = 0; break; } inkList[ni++] = e; }
+        e = cells[i].paper; found = 0;
+        for (int k = 0; k < np; k++) if (paperList[k] == e) { found = 1; break; }
+        if (!found) { if (np == 8) { fits = 0; break; } paperList[np++] = e; }
+    }
+    if (fits)
+    {
+        for (int k = 0; k < ni; k++) clut[k] = (byte)inkList[k];
+        for (int k = 0; k < np; k++) clut[8 + k] = (byte)paperList[k];
+        for (int i = 0; i < n; i++)
+        {
+            int ii = 0, pp = 0;
+            for (int k = 0; k < ni; k++) if (inkList[k] == cells[i].ink) ii = k;
+            for (int k = 0; k < np; k++) if (paperList[k] == cells[i].paper) pp = k;
+            outGroup[i] = 0; outInk[i] = (byte)ii; outPaper[i] = (byte)pp;
+        }
+        return;
+    }
+
+    // --- Slow path: k-means(4) over a 6-D (inkRGB, paperRGB) feature. ---
+    int (*feat)[6] = (int (*)[6])malloc(sizeof(*feat) * n);
+    int *assign = (int *)malloc(sizeof(int) * n);
+    if (!feat || !assign) die("Memory allocation error", NULL);
+    for (int i = 0; i < n; i++)
+    {
+        byte r, g, b;
+        plusToRGB((byte)cells[i].ink, &r, &g, &b);
+        feat[i][0] = r; feat[i][1] = g; feat[i][2] = b;
+        plusToRGB((byte)cells[i].paper, &r, &g, &b);
+        feat[i][3] = r; feat[i][4] = g; feat[i][5] = b;
+        assign[i] = 0;
+    }
+    // Deterministic spread initialisation (no RNG -> reproducible output).
+    double cen[4][6];
+    for (int k = 0; k < 4; k++)
+    {
+        int idx = (int)((long)k * (n - 1) / 3);
+        for (int dd = 0; dd < 6; dd++) cen[k][dd] = feat[idx][dd];
+    }
+    for (int iter = 0; iter < 24; iter++)
+    {
+        for (int i = 0; i < n; i++)
+        {
+            double bd = 1e30; int bk = 0;
+            for (int k = 0; k < 4; k++)
+            {
+                double s = 0;
+                for (int dd = 0; dd < 6; dd++) { double df = feat[i][dd] - cen[k][dd]; s += df * df; }
+                if (s < bd) { bd = s; bk = k; }
+            }
+            assign[i] = bk;
+        }
+        double sum[4][6] = {{0}}; int cnt[4] = {0};
+        for (int i = 0; i < n; i++)
+        {
+            int k = assign[i]; cnt[k]++;
+            for (int dd = 0; dd < 6; dd++) sum[k][dd] += feat[i][dd];
+        }
+        for (int k = 0; k < 4; k++)
+            if (cnt[k]) for (int dd = 0; dd < 6; dd++) cen[k][dd] = sum[k][dd] / cnt[k];
+            else { int idx = (int)((long)k * (n - 1) / 3); for (int dd = 0; dd < 6; dd++) cen[k][dd] = feat[idx][dd]; }
+    }
+
+    // Reduce each group's colours to its 8 ink + 8 paper slots by popularity.
+    for (int k = 0; k < 4; k++)
+    {
+        int ih[256] = {0}, ph[256] = {0};
+        for (int i = 0; i < n; i++) if (assign[i] == k) { ih[cells[i].ink]++; ph[cells[i].paper]++; }
+        pickTop8(ih, &clut[k * 16]);
+        pickTop8(ph, &clut[k * 16 + 8]);
+    }
+    // Map each cell's colours to the nearest kept slot in its group.
+    for (int i = 0; i < n; i++)
+    {
+        int k = assign[i], bi = 0, bid = 1 << 30, bp = 0, bpd = 1 << 30;
+        for (int s = 0; s < 8; s++) { int dd = plusDist((byte)cells[i].ink, clut[k*16+s]);   if (dd < bid) { bid = dd; bi = s; } }
+        for (int s = 0; s < 8; s++) { int dd = plusDist((byte)cells[i].paper, clut[k*16+8+s]); if (dd < bpd) { bpd = dd; bp = s; } }
+        outGroup[i] = (byte)k; outInk[i] = (byte)bi; outPaper[i] = (byte)bp;
+    }
+    free(feat); free(assign);
+}
+
+// Emit the bitmap byte for one 8-pixel strip against a chosen ink/paper colour.
+static byte ulaStripBits(const byte *px, int w, int f, int x0, int y, byte inkCol, byte paperCol)
+{
+    int bits = 0;
+    for (int pxl = 0; pxl < 8; pxl++)
+    {
+        const byte *p = samplePx(px, w, f, x0 + pxl, y);
+        byte e = rgbToPlus(p[0], p[1], p[2]);
+        if (plusDist(e, inkCol) < plusDist(e, paperCol)) bits |= (0x80 >> pxl);
+    }
+    return (byte)bits;
+}
+
+static void cmdPng2ScrUlaStd(const char *in, const char *out)
+{
+    int w, h, f;
+    byte *px = loadPngRGB(in, SCR_W, &w, &h, &f);
+    CellPair cells[768];
+    for (int cy = 0; cy < 24; cy++)
+        for (int cx = 0; cx < 32; cx++)
+        {
+            int hist[256]; memset(hist, 0, sizeof hist);
+            for (int py = 0; py < 8; py++)
+                for (int pxl = 0; pxl < 8; pxl++)
+                {
+                    const byte *p = samplePx(px, w, f, cx * 8 + pxl, cy * 8 + py);
+                    hist[rgbToPlus(p[0], p[1], p[2])]++;
+                }
+            int paper, ink; findTop2(hist, &paper, &ink);
+            cells[cy * 32 + cx].ink = ink; cells[cy * 32 + cx].paper = paper;
+        }
+
+    byte clut[PAL_SIZE], grp[768], ii[768], pp[768];
+    ulaQuantise(cells, 768, clut, grp, ii, pp);
+
+    byte *scr = (byte *)calloc(SCR_SIZE + PAL_SIZE, 1);
+    if (!scr) die("Memory allocation error", NULL);
+    for (int cy = 0; cy < 24; cy++)
+        for (int cx = 0; cx < 32; cx++)
+        {
+            int idx = cy * 32 + cx, g = grp[idx];
+            byte inkCol = clut[g * 16 + ii[idx]], paperCol = clut[g * 16 + 8 + pp[idx]];
+            scr[SCR_PIXELS + idx] = (byte)((g << 6) | (pp[idx] << 3) | ii[idx]);
+            for (int py = 0; py < 8; py++)
+            {
+                int y = cy * 8 + py;
+                scr[PIX_OFF(y, cx * 8)] = ulaStripBits(px, w, f, cx * 8, y, inkCol, paperCol);
+            }
+        }
+    memcpy(scr + SCR_SIZE, clut, PAL_SIZE);
+    stbi_image_free(px);
+    writeFile(out, scr, SCR_SIZE + PAL_SIZE);
+    free(scr);
+    printf("Wrote %s (%d bytes, standard + ULAplus)\n", out, SCR_SIZE + PAL_SIZE);
+}
+
+static void cmdPng2ScrUlaHiColour(const char *in, const char *out)
+{
+    int w, h, f;
+    byte *px = loadPngRGB(in, SCR_W, &w, &h, &f);
+    int n = SCR_H * 32;                       // 6144 strips (8x1)
+    CellPair *cells = (CellPair *)malloc(sizeof(CellPair) * n);
+    if (!cells) die("Memory allocation error", NULL);
+    for (int y = 0; y < SCR_H; y++)
+        for (int cx = 0; cx < 32; cx++)
+        {
+            int hist[256]; memset(hist, 0, sizeof hist);
+            for (int pxl = 0; pxl < 8; pxl++)
+            {
+                const byte *p = samplePx(px, w, f, cx * 8 + pxl, y);
+                hist[rgbToPlus(p[0], p[1], p[2])]++;
+            }
+            int paper, ink; findTop2(hist, &paper, &ink);
+            cells[y * 32 + cx].ink = ink; cells[y * 32 + cx].paper = paper;
+        }
+
+    byte clut[PAL_SIZE];
+    byte *grp = (byte *)malloc(n), *ii = (byte *)malloc(n), *pp = (byte *)malloc(n);
+    if (!grp || !ii || !pp) die("Memory allocation error", NULL);
+    ulaQuantise(cells, n, clut, grp, ii, pp);
+
+    byte *scr = (byte *)calloc(TMX_SIZE + PAL_SIZE, 1);
+    if (!scr) die("Memory allocation error", NULL);
+    byte *bmp = scr, *att = scr + SCR_PIXELS;
+    for (int y = 0; y < SCR_H; y++)
+        for (int cx = 0; cx < 32; cx++)
+        {
+            int idx = y * 32 + cx, g = grp[idx], o = PIX_OFF(y, cx * 8);
+            byte inkCol = clut[g * 16 + ii[idx]], paperCol = clut[g * 16 + 8 + pp[idx]];
+            att[o] = (byte)((g << 6) | (pp[idx] << 3) | ii[idx]);
+            bmp[o] = ulaStripBits(px, w, f, cx * 8, y, inkCol, paperCol);
+        }
+    memcpy(scr + TMX_SIZE, clut, PAL_SIZE);
+    stbi_image_free(px);
+    writeFile(out, scr, TMX_SIZE + PAL_SIZE);
+    free(scr); free(cells); free(grp); free(ii); free(pp);
+    printf("Wrote %s (%d bytes, Timex hi-colour + ULAplus)\n", out, TMX_SIZE + PAL_SIZE);
+}
+
 //~~~~ scr2gif (animate the FLASH attribute) ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~//
 // The Spectrum's FLASH bit swaps a cell's INK and PAPER ~1.56 times a second
 // (every 16 frames at 50 Hz, i.e. 32 centiseconds per state). A GIF is an
@@ -718,11 +1047,11 @@ static void gifImageData(Buf *gif, const byte *idx, size_t n, int minCode)
 // toggles INK/PAPER in FLASH cells. *hasFlash reports whether any FLASH bit is
 // set. Indices are 0-15: low 3 bits colour, bit 3 = bright. Returns malloc'd
 // buffer of *w * *h bytes (caller frees).
-static byte *sceneIndices(const byte *scr, size_t len, int swap,
+static byte *sceneIndices(const byte *scr, size_t len, int swap, const byte *clut,
                           int *w, int *h, int *hasFlash)
 {
     *hasFlash = 0;
-    if (len == TMX_HIRES)
+    if (len == TMX_HIRES || len == TMX_HIRES + PAL_SIZE)
     {
         // Hi-res has no FLASH; one global bright ink/paper pair.
         *w = HIRES_W; *h = SCR_H;
@@ -742,7 +1071,7 @@ static byte *sceneIndices(const byte *scr, size_t len, int swap,
 
     // Standard (8x8 attrs) and hi-colour (8x1 attrs) share this path; they
     // differ only in where the attribute byte lives.
-    int isHi = (len == TMX_SIZE);
+    int isHi = (len == TMX_SIZE || len == TMX_SIZE + PAL_SIZE);
     *w = SCR_W; *h = SCR_H;
     byte *out = (byte *)malloc((size_t)SCR_W * SCR_H);
     if (!out) die("Memory allocation error", NULL);
@@ -753,13 +1082,24 @@ static byte *sceneIndices(const byte *scr, size_t len, int swap,
             int o = PIX_OFF(y, x);
             int on = (bmp[o] >> (7 - (x & 7))) & 1;
             byte attr = isHi ? scr[SCR_PIXELS + o] : scr[SCR_PIXELS + ATTR_AT(y, x)];
-            int flash = attr & 0x80;
-            if (flash) *hasFlash = 1;
-            // In a flashing cell on the swapped frame, ink and paper trade.
-            int useInk = on;
-            if (flash && swap) useInk = !on;
-            int colour = useInk ? (attr & 7) : ((attr >> 3) & 7);
-            out[y * SCR_W + x] = (byte)(colour | ((attr & 0x40) ? 8 : 0));
+            if (clut)
+            {
+                // ULAplus: FLASH/BRIGHT are group bits, no animation; the index
+                // IS the 0-63 CLUT slot.
+                int grp = (attr >> 6) & 3;
+                out[y * SCR_W + x] = (byte)(on ? (grp * 16 + (attr & 7))
+                                              : (grp * 16 + 8 + ((attr >> 3) & 7)));
+            }
+            else
+            {
+                int flash = attr & 0x80;
+                if (flash) *hasFlash = 1;
+                // In a flashing cell on the swapped frame, ink and paper trade.
+                int useInk = on;
+                if (flash && swap) useInk = !on;
+                int colour = useInk ? (attr & 7) : ((attr >> 3) & 7);
+                out[y * SCR_W + x] = (byte)(colour | ((attr & 0x40) ? 8 : 0));
+            }
         }
     return out;
 }
@@ -785,33 +1125,36 @@ static void cmdScr2Gif(const char *in, const char *out, int normal, int scale, i
 {
     size_t len;
     byte *scr = readFile(in, &len);
-    if (len != SCR_SIZE && len != TMX_SIZE && len != TMX_HIRES)
-    {
-        free(scr);
-        die("Unrecognised .scr size (need 6912, 12288 or 12289):", in);
-    }
+    Detected d = detect(len);
+    if (!d.valid) { free(scr); die(BAD_SIZE_MSG, in); }
+
+    // ULAplus attribute screens carry their own 64-colour palette and never
+    // flash; hi-res keeps its 16-entry fixed palette even when 64 regs trail.
+    const byte *clut = (d.palette && d.mode != mHiRes) ? scr + len - PAL_SIZE : NULL;
 
     // Build the two candidate frames; keep only the second if it differs.
     int w, h, flashA, flashB, ow, oh;
-    byte *fa = sceneIndices(scr, len, 0, &w, &h, &flashA);
-    byte *fb = sceneIndices(scr, len, 1, &w, &h, &flashB);
+    byte *fa = sceneIndices(scr, len, 0, clut, &w, &h, &flashA);
+    byte *fb = sceneIndices(scr, len, 1, clut, &w, &h, &flashB);
     int animate = flashA;                       // FLASH present -> two frames
     byte *frame0 = scaleIndices(fa, w, h, scale, &ow, &oh);
     byte *frame1 = animate ? scaleIndices(fb, w, h, scale, &ow, &oh) : NULL;
     free(fa); free(fb);
 
-    // 16-entry global colour table: index = colour | bright<<3.
-    byte pal[16 * 3];
-    for (int i = 0; i < 16; i++)
-        indexToRGB(i & 7, i & 8, normal, &pal[i * 3], &pal[i * 3 + 1], &pal[i * 3 + 2]);
+    // Global colour table: 64 GRB332 entries for ULAplus, else the 16 fixed
+    // Spectrum colours (index = colour | bright<<3).
+    int palBits = clut ? 6 : 4, palN = 1 << palBits;
+    byte pal[64 * 3];
+    if (clut) for (int i = 0; i < 64; i++) plusToRGB(clut[i], &pal[i*3], &pal[i*3+1], &pal[i*3+2]);
+    else      for (int i = 0; i < 16; i++) indexToRGB(i & 7, i & 8, normal, &pal[i*3], &pal[i*3+1], &pal[i*3+2]);
 
     Buf g = {0};
     bufMem(&g, "GIF89a", 6);
     bufLE16(&g, ow); bufLE16(&g, oh);
-    bufByte(&g, 0x80 | (3 << 4) | 3);   // GCT present, 4-bit colour, 16 entries
+    bufByte(&g, 0x80 | ((palBits - 1) << 4) | (palBits - 1));   // GCT, palN entries
     bufByte(&g, 0);                     // background colour index
     bufByte(&g, 0);                     // pixel aspect ratio
-    bufMem(&g, pal, sizeof pal);
+    bufMem(&g, pal, (size_t)palN * 3);
 
     if (animate)
     {
@@ -838,7 +1181,7 @@ static void cmdScr2Gif(const char *in, const char *out, int normal, int scale, i
         bufLE16(&g, 0); bufLE16(&g, 0);     // left, top
         bufLE16(&g, ow); bufLE16(&g, oh);   // width, height
         bufByte(&g, 0x00);                  // no local colour table
-        gifImageData(&g, frames[fr], (size_t)ow * oh, 4);
+        gifImageData(&g, frames[fr], (size_t)ow * oh, palBits);
     }
     bufByte(&g, 0x3B);                       // trailer
 
@@ -853,46 +1196,83 @@ static void cmdScr2Gif(const char *in, const char *out, int normal, int scale, i
 static const char *kColour[8] =
     { "black", "blue", "red", "magenta", "green", "cyan", "yellow", "white" };
 
+// Dump a 64-entry CLUT as 4 groups x (8 ink + 8 paper) GRB332 -> RGB hex.
+static void printPalette(const byte *clut)
+{
+    printf("ULAplus palette (64 GRB332 registers):\n");
+    for (int grp = 0; grp < 4; grp++)
+    {
+        printf("  group %d  ink:", grp);
+        for (int s = 0; s < 8; s++)
+        {
+            byte r, g, b; plusToRGB(clut[grp * 16 + s], &r, &g, &b);
+            printf(" %02X%02X%02X", r, g, b);
+        }
+        printf("\n           paper:");
+        for (int s = 0; s < 8; s++)
+        {
+            byte r, g, b; plusToRGB(clut[grp * 16 + 8 + s], &r, &g, &b);
+            printf(" %02X%02X%02X", r, g, b);
+        }
+        printf("\n");
+    }
+}
+
 static void cmdInfo(const char *in)
 {
     size_t len;
     byte *scr = readFile(in, &len);
+    Detected d = detect(len);
     printf("File: %s\n", in);
     printf("Size: %zu bytes\n", len);
+    if (!d.valid) { printf("Mode: unrecognised\n"); free(scr); return; }
 
-    if (len == SCR_SIZE || len == TMX_SIZE)
+    const byte *clut = d.palette ? scr + len - PAL_SIZE : NULL;
+
+    if (d.mode == mStd || d.mode == mHiColour)
     {
-        // Both standard and hi-colour carry a block of standard attribute
-        // bytes; only the count and geometry differ.
-        int isHi = (len == TMX_SIZE);
-        printf("Mode: %s\n", isHi ? "Timex hi-colour (256x192, 8x1 attrs)"
-                                  : "standard (256x192, 8x8 attrs)");
+        int isHi = (d.mode == mHiColour);
+        printf("Mode: %s%s\n",
+               isHi ? "Timex hi-colour (256x192, 8x1 attrs)"
+                    : "standard (256x192, 8x8 attrs)",
+               d.palette ? " + ULAplus 64-colour palette" : "");
         const byte *att = scr + SCR_PIXELS;
         int n = isHi ? SCR_PIXELS : SCR_ATTRS;
-        int inkUse[8] = {0}, paperUse[8] = {0}, bright = 0, flash = 0;
-        for (int i = 0; i < n; i++)
+        if (d.palette)
         {
-            byte a = att[i];
-            inkUse[a & 7]++; paperUse[(a >> 3) & 7]++;
-            if (a & 0x40) bright++;
-            if (a & 0x80) flash++;
+            // FLASH/BRIGHT are CLUT group bits here, not flash/bright.
+            int grpUse[4] = {0};
+            for (int i = 0; i < n; i++) grpUse[(att[i] >> 6) & 3]++;
+            printf("CLUT group use:");
+            for (int gpe = 0; gpe < 4; gpe++) printf(" %d:%d", gpe, grpUse[gpe]);
+            printf("\n");
+            printPalette(clut);
         }
-        printf("Bright attrs: %d / %d\n", bright, n);
-        printf("Flash attrs:  %d / %d\n", flash, n);
-        printf("Ink:   "); for (int c = 0; c < 8; c++) if (inkUse[c]) printf("%s(%d) ", kColour[c], inkUse[c]);
-        printf("\nPaper: "); for (int c = 0; c < 8; c++) if (paperUse[c]) printf("%s(%d) ", kColour[c], paperUse[c]);
-        printf("\n");
+        else
+        {
+            int inkUse[8] = {0}, paperUse[8] = {0}, bright = 0, flash = 0;
+            for (int i = 0; i < n; i++)
+            {
+                byte a = att[i];
+                inkUse[a & 7]++; paperUse[(a >> 3) & 7]++;
+                if (a & 0x40) bright++;
+                if (a & 0x80) flash++;
+            }
+            printf("Bright attrs: %d / %d\n", bright, n);
+            printf("Flash attrs:  %d / %d\n", flash, n);
+            printf("Ink:   "); for (int c = 0; c < 8; c++) if (inkUse[c]) printf("%s(%d) ", kColour[c], inkUse[c]);
+            printf("\nPaper: "); for (int c = 0; c < 8; c++) if (paperUse[c]) printf("%s(%d) ", kColour[c], paperUse[c]);
+            printf("\n");
+        }
     }
-    else if (len == TMX_HIRES)
+    else  // hi-res
     {
         int port = scr[TMX_SIZE], ink = (port >> 3) & 7;
-        printf("Mode: Timex hi-res (512x192 mono)\n");
+        printf("Mode: Timex hi-res (512x192 mono)%s\n",
+               d.palette ? " + ULAplus palette (not applied to render)" : "");
         printf("Colour byte: 0x%02X -> ink %s on paper %s (bright)\n",
                port, kColour[ink], kColour[7 - ink]);
-    }
-    else
-    {
-        printf("Mode: unrecognised (expected 6912, 12288 or 12289)\n");
+        if (d.palette) printPalette(clut);
     }
     free(scr);
 }
@@ -904,7 +1284,7 @@ int main(int argc, char **argv)
     enum Command cmd = cmNone;
     enum Mode mode = mStd;
     const char *fileIn = NULL, *fileOut = NULL;
-    int normal = DEF_NORMAL, scale = 1, delayCs = 32;
+    int normal = DEF_NORMAL, scale = 1, delayCs = 32, ulaplus = 0;
 
     for (int i = 1; i < argc; i++)
     {
@@ -913,6 +1293,7 @@ int main(int argc, char **argv)
         else if (strcmp(a, "--level") == 0 && i + 1 < argc) normal = atoi(argv[++i]) & 0xff;
         else if (strcmp(a, "--scale") == 0 && i + 1 < argc) { scale = atoi(argv[++i]); if (scale < 1) scale = 1; }
         else if (strcmp(a, "--delay") == 0 && i + 1 < argc) { delayCs = atoi(argv[++i]); if (delayCs < 1) delayCs = 1; }
+        else if (strcmp(a, "--ulaplus") == 0) ulaplus = 1;
         else if (strcmp(a, "--palette") == 0 && i + 1 < argc)
         {
             const char *p = argv[++i];
@@ -945,7 +1326,14 @@ int main(int argc, char **argv)
     {
         case cmPng2Scr:
             if (!fileOut) die("Missing output .scr file", NULL);
-            if      (mode == mStd)      cmdPng2ScrStd(fileIn, fileOut);
+            if (ulaplus)
+            {
+                if      (mode == mStd)      cmdPng2ScrUlaStd(fileIn, fileOut);
+                else if (mode == mHiColour) cmdPng2ScrUlaHiColour(fileIn, fileOut);
+                else die("hi-res + ULAplus output is not supported "
+                         "(the palette mapping is under-specified)", NULL);
+            }
+            else if (mode == mStd)      cmdPng2ScrStd(fileIn, fileOut);
             else if (mode == mHiColour) cmdPng2ScrHiColour(fileIn, fileOut);
             else                        cmdPng2ScrHiRes(fileIn, fileOut);
             break;
