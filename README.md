@@ -165,7 +165,6 @@ with the `0xBF` convention, for example.
 
 ## Roadmap
 
-* Direct ingestion from TAP `SCREEN$` blocks (pairs with `taput export-png`).
 * Hi-res + ULAplus colour mapping, if a de-facto standard emerges.
 
 ## Building
