@@ -1,4 +1,4 @@
-// scr-tools - ZX Spectrum SCREEN$ (.scr) manipulation utility
+// scrtools - ZX Spectrum SCREEN$ (.scr) manipulation utility
 //
 // Part of the LOADZX toolset (see also: taput, tomato).
 //
@@ -106,7 +106,7 @@ typedef unsigned char byte;
 //~~~~ CLI ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~//
 
 static const char *Help =
-    "SCR-TOOLS " STR(BUILD_TS) " - ZX Spectrum SCREEN$ utility\n"
+    "SCRTOOLS " STR(BUILD_TS) " - ZX Spectrum SCREEN$ utility\n"
     "\n"
     "Usage:\n"
     "    scrtools command [options] FileIn [FileOut]\n"

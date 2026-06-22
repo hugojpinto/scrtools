@@ -1,4 +1,4 @@
-# scr-tools
+# scrtools
 
 Command line tool for manipulating ZX Spectrum `SCREEN$` (`.scr`) files —
 standard resolution **and** the Timex SCLD extended modes (hi-colour and
@@ -122,7 +122,7 @@ wild, so hi-res is rendered with its fixed colour pair.
 ## The palette
 
 The Spectrum is an analogue machine; "normal" brightness is ≈85% of the bright
-voltage, which different tools digitise to different RGB levels. scr-tools
+voltage, which different tools digitise to different RGB levels. scrtools
 defaults to the modern de-facto standard and lets you override it:
 
 | `--palette` | Level | Hex  | Used by |

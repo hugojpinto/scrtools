@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regression suite for scr-tools.
+# Regression suite for scrtools.
 #
 # Usage: bash scripts/regression.sh ./scrtools
 #

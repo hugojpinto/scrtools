@@ -1,5 +1,5 @@
 #~~~~   SETTINGS   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
-# scr-tools - ZX Spectrum SCREEN$ utility (part of the LOADZX toolset).
+# scrtools - ZX Spectrum SCREEN$ utility (part of the LOADZX toolset).
 # Single translation unit (scrtools.c) plus the vendored stb_image.h header.
 CC?=cc
 CFLAGS?=-O3 -Wall -Wextra
