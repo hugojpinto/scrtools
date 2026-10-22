@@ -38,6 +38,8 @@ Options:
     --photo          png2scr (std/hicolour): for photographs -- each cell
                      tries every ink/paper/BRIGHT pair and keeps the one
                      that best spans its pixels; dithered in linear light.
+    --no-bright      png2scr --photo: never set BRIGHT, so the picture's
+                     white is the border's white (the border has no BRIGHT).
     --scale <n>      Upscale scr2png / scr2gif output by factor n.
     --delay <cs>     FLASH frame delay for scr2gif, centiseconds
                      (default 32 = the hardware ~1.56 Hz rate).

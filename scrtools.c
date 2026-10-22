@@ -138,6 +138,8 @@ static const char *Help =
     "    --photo          png2scr (std/hicolour): for photographs -- each cell\n"
     "                     tries every ink/paper/BRIGHT pair and keeps the one\n"
     "                     that best spans its pixels; dithered in linear light.\n"
+    "    --no-bright      png2scr --photo: never set BRIGHT, so the picture's\n"
+    "                     white is the border's white (the border has no BRIGHT).\n"
     "    --scale <n>      Upscale scr2png / scr2gif output by factor n.\n"
     "    --delay <cs>     FLASH frame delay for scr2gif, centiseconds\n"
     "                     (default 32 = the hardware ~1.56 Hz rate).\n"
@@ -804,7 +806,7 @@ static double segDist(const double *p, const double *a, const double *b)
     return d;
 }
 
-static void cmdPng2ScrPhoto(const char *in, const char *out, int cellH, int normal)
+static void cmdPng2ScrPhoto(const char *in, const char *out, int cellH, int normal, int noBright)
 {
     int w, h, f;
     byte *px = loadPngRGB(in, SCR_W, &w, &h, &f);
@@ -836,7 +838,7 @@ static void cmdPng2ScrPhoto(const char *in, const char *out, int cellH, int norm
         for (int cx = 0; cx < 32; cx++)
         {
             double best = 1e30; int ba = 0, bb = 0;
-            for (int br = 0; br < 2; br++)
+            for (int br = 0; br < (noBright ? 1 : 2); br++)
                 for (int i = 0; i < 8; i++)
                     for (int j = i; j < 8; j++)
                     {
@@ -1521,7 +1523,7 @@ int main(int argc, char **argv)
     enum Command cmd = cmNone;
     enum Mode mode = mStd;
     const char *fileIn = NULL, *fileOut = NULL;
-    int normal = DEF_NORMAL, scale = 1, delayCs = 32, ulaplus = 0, dither = 0, photo = 0;
+    int normal = DEF_NORMAL, scale = 1, delayCs = 32, ulaplus = 0, dither = 0, photo = 0, noBright = 0;
 
     for (int i = 1; i < argc; i++)
     {
@@ -1533,6 +1535,7 @@ int main(int argc, char **argv)
         else if (strcmp(a, "--ulaplus") == 0) ulaplus = 1;
         else if (strcmp(a, "--dither") == 0) dither = 1;
         else if (strcmp(a, "--photo") == 0) photo = 1;
+        else if (strcmp(a, "--no-bright") == 0) noBright = 1;
         else if (strcmp(a, "--palette") == 0 && i + 1 < argc)
         {
             const char *p = argv[++i];
@@ -1568,7 +1571,7 @@ int main(int argc, char **argv)
             if (photo)
             {
                 if (ulaplus || mode == mHiRes) die("--photo supports std and hicolour (no ULAplus)", NULL);
-                cmdPng2ScrPhoto(fileIn, fileOut, mode == mStd ? 8 : 1, normal);
+                cmdPng2ScrPhoto(fileIn, fileOut, mode == mStd ? 8 : 1, normal, noBright);
             }
             else if (ulaplus)
             {
