@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <math.h>
 
 // -- Vendored PNG decoder ------------------------------------------------
 // stb_image.h is a single-header, public-domain image loader. We compile its
@@ -134,6 +135,9 @@ static const char *Help =
     "                     classic (205), emulator (192).\n"
     "    --dither         png2scr: Floyd-Steinberg dither the bitmap between\n"
     "                     each cell's two colours (helps shaded images).\n"
+    "    --photo          png2scr (std/hicolour): for photographs -- each cell\n"
+    "                     tries every ink/paper/BRIGHT pair and keeps the one\n"
+    "                     that best spans its pixels; dithered in linear light.\n"
     "    --scale <n>      Upscale scr2png / scr2gif output by factor n.\n"
     "    --delay <cs>     FLASH frame delay for scr2gif, centiseconds\n"
     "                     (default 32 = the hardware ~1.56 Hz rate).\n"
@@ -143,6 +147,7 @@ static const char *Help =
     "    scrtools png2scr --mode hires logo512.png logo.scr\n"
     "    scrtools png2scr --mode hicolour pic.png pic.scr\n"
     "    scrtools png2scr --ulaplus photo.png photo.scr\n"
+    "    scrtools png2scr --mode hicolour --photo machine.png machine.scr\n"
     "    scrtools scr2png factory.scr factory.png\n"
     "    scrtools scr2png --palette emulator factory.scr factory.png\n"
     "    scrtools scr2gif --scale 2 demo.scr demo.gif\n"
@@ -767,6 +772,127 @@ static void cmdPng2ScrHiColour(const char *in, const char *out, int dither)
     writeFile(out, scr, TMX_SIZE);
     free(scr); free(cellInk); free(cellPaper);
     printf("Wrote %s (%d bytes, Timex hi-colour%s)\n", out, TMX_SIZE, dither ? ", dithered" : "");
+}
+
+//~~~~ png2scr --photo: per-cell exhaustive search, linear-light dithering ~~//
+// For photographs. The cell colours above come from thresholding each pixel
+// into one of the 8 indices, which suits pixel art but turns real shading
+// (a black case, grey keys, highlights) into blocks. Here every cell tries
+// all 72 ink/paper/BRIGHT combinations (36 pairs x 2) and keeps the one whose
+// colour SEGMENT passes closest to its pixels, in linear light: whatever lies
+// on the segment between the two colours can be reproduced by dithering
+// between them. The bitmap is then Floyd-Steinberg dithered in linear light,
+// each pixel restricted to its own cell's pair. cellH = 8 (standard) or 1
+// (Timex hi-colour).
+
+static double srgbToLin(int v)
+{
+    double c = v / 255.0;
+    return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);
+}
+
+// Squared distance from p to the segment [a,b], luma-weighted.
+static double segDist(const double *p, const double *a, const double *b)
+{
+    static const double W[3] = { 0.30, 0.59, 0.11 };
+    double ab[3], ap[3], num = 0, den = 0;
+    for (int c = 0; c < 3; c++) { ab[c] = b[c] - a[c]; ap[c] = p[c] - a[c]; num += W[c]*ab[c]*ap[c]; den += W[c]*ab[c]*ab[c]; }
+    double t = den > 0 ? num / den : 0;
+    if (t < 0) t = 0; else if (t > 1) t = 1;
+    double d = 0;
+    for (int c = 0; c < 3; c++) { double e = ap[c] - t * ab[c]; d += W[c] * e * e; }
+    return d;
+}
+
+static void cmdPng2ScrPhoto(const char *in, const char *out, int cellH, int normal)
+{
+    int w, h, f;
+    byte *px = loadPngRGB(in, SCR_W, &w, &h, &f);
+    int size = (cellH == 8) ? SCR_SIZE : TMX_SIZE;
+    byte *scr = (byte *)calloc(size, 1);
+    double *lin = (double *)malloc(sizeof(double) * SCR_W * SCR_H * 3);
+    if (!scr || !lin) die("Memory allocation error", NULL);
+    for (int y = 0; y < SCR_H; y++)
+        for (int x = 0; x < SCR_W; x++)
+        {
+            const byte *p = samplePx(px, w, f, x, y);
+            for (int c = 0; c < 3; c++) lin[(y * SCR_W + x) * 3 + c] = srgbToLin(p[c]);
+        }
+    stbi_image_free(px);
+
+    // The 16 displayable colours (index | bright<<3) in linear light.
+    double pal[16][3];
+    for (int i = 0; i < 16; i++)
+    {
+        byte r, g, b;
+        indexToRGB(i & 7, i >> 3, normal, &r, &g, &b);
+        pal[i][0] = srgbToLin(r); pal[i][1] = srgbToLin(g); pal[i][2] = srgbToLin(b);
+    }
+
+    int rows = SCR_H / cellH;
+    int *cellA = (int *)malloc(sizeof(int) * rows * 32), *cellB = (int *)malloc(sizeof(int) * rows * 32);
+    if (!cellA || !cellB) die("Memory allocation error", NULL);
+    for (int cy = 0; cy < rows; cy++)
+        for (int cx = 0; cx < 32; cx++)
+        {
+            double best = 1e30; int ba = 0, bb = 0;
+            for (int br = 0; br < 2; br++)
+                for (int i = 0; i < 8; i++)
+                    for (int j = i; j < 8; j++)
+                    {
+                        const double *a = pal[i | (br << 3)], *b = pal[j | (br << 3)];
+                        double e = 0;
+                        for (int py = 0; py < cellH && e < best; py++)
+                            for (int pxl = 0; pxl < 8; pxl++)
+                                e += segDist(&lin[((cy * cellH + py) * SCR_W + cx * 8 + pxl) * 3], a, b);
+                        if (e < best) { best = e; ba = i | (br << 3); bb = j | (br << 3); }
+                    }
+            cellA[cy * 32 + cx] = ba; cellB[cy * 32 + cx] = bb;
+        }
+
+    // Floyd-Steinberg in linear light; the residual is clamped so a cell whose
+    // pair cannot reach a colour does not smear the error across the picture.
+    double (*err)[SCR_W + 2][3] = calloc(2, sizeof *err);
+    if (!err) die("Memory allocation error", NULL);
+    for (int y = 0; y < SCR_H; y++)
+    {
+        double (*cur)[3] = err[y & 1] + 1, (*nxt)[3] = err[(y + 1) & 1] + 1;
+        memset(err[(y + 1) & 1], 0, sizeof err[0]);
+        int bits = 0, inkCount[32] = {0};
+        for (int x = 0; x < SCR_W; x++)
+        {
+            int cell = (y / cellH) * 32 + (x >> 3);
+            const double *a = pal[cellA[cell]], *b = pal[cellB[cell]];
+            double t[3], da = 0, db = 0;
+            for (int c = 0; c < 3; c++)
+            {
+                t[c] = lin[(y * SCR_W + x) * 3 + c] + cur[x][c];
+                da += (t[c] - a[c]) * (t[c] - a[c]); db += (t[c] - b[c]) * (t[c] - b[c]);
+            }
+            const double *ch = (db < da) ? b : a;
+            if (db < da) { bits |= 0x80 >> (x & 7); inkCount[x >> 3]++; }
+            for (int c = 0; c < 3; c++)
+            {
+                double e = t[c] - ch[c];
+                if (e > 0.25) e = 0.25; else if (e < -0.25) e = -0.25;
+                cur[x + 1][c] += e * 7.0 / 16; nxt[x - 1][c] += e * 3.0 / 16;
+                nxt[x][c] += e * 5.0 / 16;     nxt[x + 1][c] += e * 1.0 / 16;
+            }
+            if ((x & 7) == 7) { scr[PIX_OFF(y, x & ~7)] = (byte)bits; bits = 0; }
+        }
+    }
+    // Attributes: B is INK (set bits), A is PAPER; BRIGHT is shared by the pair.
+    for (int cy = 0; cy < rows; cy++)
+        for (int cx = 0; cx < 32; cx++)
+        {
+            int a = cellA[cy * 32 + cx], b = cellB[cy * 32 + cx];
+            byte attr = (byte)(((a >> 3) << 6) | ((a & 7) << 3) | (b & 7));
+            if (cellH == 8) scr[SCR_PIXELS + cy * 32 + cx] = attr;
+            else            scr[SCR_PIXELS + PIX_OFF(cy, cx * 8)] = attr;
+        }
+    writeFile(out, scr, size);
+    printf("Wrote %s (%d bytes, %s, photo)\n", out, size, cellH == 8 ? "standard" : "Timex hi-colour");
+    free(scr); free(lin); free(cellA); free(cellB); free(err);
 }
 
 //~~~~ png2scr: Timex hi-res (512x192 mono + colour byte) ~~~~~~~~~~~~~~~~~~//
@@ -1395,7 +1521,7 @@ int main(int argc, char **argv)
     enum Command cmd = cmNone;
     enum Mode mode = mStd;
     const char *fileIn = NULL, *fileOut = NULL;
-    int normal = DEF_NORMAL, scale = 1, delayCs = 32, ulaplus = 0, dither = 0;
+    int normal = DEF_NORMAL, scale = 1, delayCs = 32, ulaplus = 0, dither = 0, photo = 0;
 
     for (int i = 1; i < argc; i++)
     {
@@ -1406,6 +1532,7 @@ int main(int argc, char **argv)
         else if (strcmp(a, "--delay") == 0 && i + 1 < argc) { delayCs = atoi(argv[++i]); if (delayCs < 1) delayCs = 1; }
         else if (strcmp(a, "--ulaplus") == 0) ulaplus = 1;
         else if (strcmp(a, "--dither") == 0) dither = 1;
+        else if (strcmp(a, "--photo") == 0) photo = 1;
         else if (strcmp(a, "--palette") == 0 && i + 1 < argc)
         {
             const char *p = argv[++i];
@@ -1438,7 +1565,12 @@ int main(int argc, char **argv)
     {
         case cmPng2Scr:
             if (!fileOut) die("Missing output .scr file", NULL);
-            if (ulaplus)
+            if (photo)
+            {
+                if (ulaplus || mode == mHiRes) die("--photo supports std and hicolour (no ULAplus)", NULL);
+                cmdPng2ScrPhoto(fileIn, fileOut, mode == mStd ? 8 : 1, normal);
+            }
+            else if (ulaplus)
             {
                 if      (mode == mStd)      cmdPng2ScrUlaStd(fileIn, fileOut, dither);
                 else if (mode == mHiColour) cmdPng2ScrUlaHiColour(fileIn, fileOut, dither);

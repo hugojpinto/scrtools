@@ -35,6 +35,9 @@ Options:
                      classic (205), emulator (192).
     --dither         png2scr: Floyd-Steinberg dither the bitmap between
                      each cell's two colours (helps shaded images).
+    --photo          png2scr (std/hicolour): for photographs -- each cell
+                     tries every ink/paper/BRIGHT pair and keeps the one
+                     that best spans its pixels; dithered in linear light.
     --scale <n>      Upscale scr2png / scr2gif output by factor n.
     --delay <cs>     FLASH frame delay for scr2gif, centiseconds
                      (default 32 = the hardware ~1.56 Hz rate).
@@ -45,6 +48,7 @@ Examples:
     scrtools png2scr --mode hicolour pic.png pic.scr
     scrtools png2scr --ulaplus photo.png photo.scr
     scrtools png2scr --ulaplus --dither photo.png photo.scr
+    scrtools png2scr --mode hicolour --photo machine.png machine.scr
     scrtools scr2png demo.scr demo.png
     scrtools scr2png --palette emulator demo.scr demo.png
     scrtools scr2gif --scale 2 demo.scr demo.gif

@@ -196,6 +196,18 @@ cmp -s "$TMP/g_nd.scr" "$TMP/g_d.scr" \
 "$BIN" png2scr --ulaplus --dither "$TMP/grad.png" "$TMP/g_ud.scr" >/dev/null
 [ "$(wc -c < "$TMP/g_ud.scr")" -eq 6976 ] && ok "dithered ULAplus is 6976 bytes" || bad "dithered ULAplus size"
 
+# --- Test 12: --photo -----------------------------------------------------
+# Sizes are right, and a screen that is already in the Spectrum palette (the
+# seed render) survives: every cell's pair can reproduce its pixels exactly.
+"$BIN" png2scr --photo "$TMP/grad.png" "$TMP/g_p.scr" >/dev/null
+[ "$(wc -c < "$TMP/g_p.scr")" -eq 6912 ] && ok "photo std is 6912 bytes" || bad "photo std size"
+"$BIN" png2scr --mode hicolour --photo "$TMP/grad.png" "$TMP/g_ph.scr" >/dev/null
+[ "$(wc -c < "$TMP/g_ph.scr")" -eq 12288 ] && ok "photo hicolour is 12288 bytes" || bad "photo hicolour size"
+"$BIN" png2scr --photo "$TMP/p0.png" "$TMP/seed_p.scr" >/dev/null
+"$BIN" scr2png "$TMP/seed_p.scr" "$TMP/seed_p.png" >/dev/null
+cmp -s "$TMP/p0.png" "$TMP/seed_p.png" && ok "photo reproduces a palette-exact screen" \
+    || bad "photo reproduces a palette-exact screen"
+
 echo
 echo "Passed: $pass  Failed: $fail"
 [ "$fail" -eq 0 ]
