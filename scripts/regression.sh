@@ -241,6 +241,23 @@ else ok "info exits non-zero on unrecognised input"; fi
 cmp -s "$TMP/l192.png" "$TMP/l192b.png" \
     && ok "png -> scr -> png identical at --level 192" || bad "png -> scr -> png at --level 192"
 
+# --- Test 15: transparency composites onto black --------------------------
+# Fully transparent pixels hiding white RGB must convert as black, with a warning.
+python3 - "$TMP/alpha.png" <<'PY'
+import sys
+from PIL import Image
+Image.new("RGBA", (256, 192), (255, 255, 255, 0)).save(sys.argv[1])
+PY
+"$BIN" png2scr "$TMP/alpha.png" "$TMP/alpha.scr" 2>"$TMP/alpha.err" >/dev/null
+grep -q "transparent pixels" "$TMP/alpha.err" && ok "transparent PNG warns" || bad "transparent PNG warns"
+if python3 - "$TMP/alpha.scr" <<'PY'
+import sys
+d = open(sys.argv[1], "rb").read()
+# All-black screen: every attribute's ink and paper are black, no BRIGHT.
+sys.exit(0 if all((a & 0x7f) == 0 for a in d[6144:]) else 1)
+PY
+then ok "transparent pixels convert as black"; else bad "transparent pixels convert as black"; fi
+
 echo
 echo "Passed: $pass  Failed: $fail"
 [ "$fail" -eq 0 ]

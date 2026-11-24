@@ -153,7 +153,8 @@ its own palette and hi-res is always BRIGHT, so they ignore it.
   faithful render converts losslessly; a clashing cell snaps to its two dominant
   colours rather than being rejected. `--dither` adds Floyd-Steinberg error
   diffusion when choosing ink-vs-paper per pixel, trading hard edges for smooth
-  shading — most useful on gradients and photos.
+  shading — most useful on gradients and photos. Transparent PNG pixels are
+  composited onto black (with a warning).
 * The rendered image is the canonical truth: `png → scr → png` is
   **pixel-identical** (at a matching `--level`), and `png2scr` output is a stable
   **fixed point**. On real Timex hi-res samples, `scr → png → scr` is even

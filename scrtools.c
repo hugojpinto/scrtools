@@ -190,7 +190,7 @@ static void writeFile(const char *name, const byte *data, size_t len)
     FILE *f = fopen(name, "wb");
     if (!f) die("Unable to create file", name);
     if (fwrite(data, 1, len, f) != len) { fclose(f); die("Error writing", name); }
-    fclose(f);
+    if (fclose(f) != 0) die("Error writing", name);   // e.g. disk full on flush
 }
 
 //~~~~ PNG encode (stored DEFLATE, no zlib) ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~//
@@ -260,17 +260,20 @@ static byte *zlibStore(const byte *data, size_t len, size_t *outLen)
     return out;
 }
 
-static void writePngChunk(FILE *f, const char *type, const byte *data, size_t len)
+// Returns 0 on success, -1 if any write failed.
+static int writePngChunk(FILE *f, const char *type, const byte *data, size_t len)
 {
+    int ok = 1;
     byte hdr[4] = { (len >> 24) & 0xff, (len >> 16) & 0xff, (len >> 8) & 0xff, len & 0xff };
-    fwrite(hdr, 1, 4, f);
-    fwrite(type, 1, 4, f);
-    if (len) fwrite(data, 1, len, f);
+    ok &= fwrite(hdr, 1, 4, f) == 4;
+    ok &= fwrite(type, 1, 4, f) == 4;
+    if (len) ok &= fwrite(data, 1, len, f) == len;
     // CRC covers the chunk type AND its data (but not the length field).
     uint32_t c = crc32buf((const byte *)type, 4, 0xffffffffUL);
     c = crc32buf(data, len, c) ^ 0xffffffffUL;
     byte crc[4] = { (c >> 24) & 0xff, (c >> 16) & 0xff, (c >> 8) & 0xff, c & 0xff };
-    fwrite(crc, 1, 4, f);
+    ok &= fwrite(crc, 1, 4, f) == 4;
+    return ok ? 0 : -1;
 }
 
 // Write an RGB truecolour PNG from a tightly packed w*h*3 buffer.
@@ -302,12 +305,13 @@ static void writeRgbPng(const char *name, const byte *rgb, int w, int h)
         (h >> 24) & 0xff, (h >> 16) & 0xff, (h >> 8) & 0xff, h & 0xff,
         8, 2, 0, 0, 0    // 8-bit, truecolour RGB, no compression/filter/interlace
     };
-    fwrite(sig, 1, 8, f);
-    writePngChunk(f, "IHDR", ihdr, 13);
-    writePngChunk(f, "IDAT", zdata, zlen);
-    writePngChunk(f, "IEND", NULL, 0);
-    fclose(f);
+    int err = fwrite(sig, 1, 8, f) != 8;
+    err |= writePngChunk(f, "IHDR", ihdr, 13) != 0;
+    err |= writePngChunk(f, "IDAT", zdata, zlen) != 0;
+    err |= writePngChunk(f, "IEND", NULL, 0) != 0;
+    err |= fclose(f) != 0;
     free(zdata);
+    if (err) die("Error writing", name);
 }
 
 //~~~~ Colour helpers ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~//
@@ -520,14 +524,30 @@ static void cmdScr2Png(const char *in, const char *out, int normal, int scale)
 // Decode a PNG to a forced-RGB buffer and validate its size against the target
 // logical resolution (wantW x SCR_H). Integer multiples are accepted and the
 // down-sample factor is returned in *f. Caller frees with stbi_image_free.
+// Transparency is composited onto black (with a warning) so that the colour
+// hidden under transparent pixels -- arbitrary in the file -- cannot leak in.
 static byte *loadPngRGB(const char *in, int wantW, int *w, int *h, int *f)
 {
     size_t flen;
     byte *fbuf = readFile(in, &flen);
     int comp;
-    byte *px = stbi_load_from_memory(fbuf, (int)flen, w, h, &comp, 3);
+    if (flen > INT32_MAX) { free(fbuf); die("PNG too large:", in); }
+    byte *px = stbi_load_from_memory(fbuf, (int)flen, w, h, &comp, 4);
     free(fbuf);
     if (!px) die("Cannot decode PNG:", in);
+    // Squeeze RGBA to RGB in place (write index never overtakes read index),
+    // premultiplying by alpha = compositing over black.
+    size_t npx = (size_t)*w * *h;
+    int translucent = 0;
+    for (size_t i = 0; i < npx; i++)
+    {
+        int al = px[i * 4 + 3];
+        if (al != 255) translucent = 1;
+        for (int c = 0; c < 3; c++)
+            px[i * 3 + c] = (byte)((px[i * 4 + c] * al + 127) / 255);
+    }
+    if (translucent)
+        fprintf(stderr, "Warning: %s has transparent pixels; composited onto black\n", in);
     if (*w % wantW != 0 || *h % SCR_H != 0 || *w / wantW != *h / SCR_H)
     {
         stbi_image_free(px);
