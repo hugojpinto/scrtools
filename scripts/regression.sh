@@ -214,6 +214,25 @@ cmp -s "$TMP/g_nd.scr" "$TMP/g_d.scr" \
 cmp -s "$TMP/p0.png" "$TMP/seed_p.png" && ok "photo reproduces a palette-exact screen" \
     || bad "photo reproduces a palette-exact screen"
 
+# --- Test 13: CLI validation (audit fixes) -------------------------------
+# rejects WHAT CMD...: CMD must exit non-zero and write no output file.
+rejects() { local what="$1"; shift
+    rm -f "$TMP/cli.out"
+    if "$@" >/dev/null 2>&1 || [ -e "$TMP/cli.out" ]; then bad "$what"; else ok "$what"; fi; }
+rejects "--level out of range is rejected"     "$BIN" scr2png --level 300 "$TMP/seed.scr" "$TMP/cli.out"
+rejects "--level non-number is rejected"       "$BIN" scr2png --level abc "$TMP/seed.scr" "$TMP/cli.out"
+rejects "--scale above the cap is rejected"    "$BIN" scr2gif --scale 256 "$TMP/seed.scr" "$TMP/cli.out"
+rejects "--scale 0 is rejected"                "$BIN" scr2png --scale 0 "$TMP/seed.scr" "$TMP/cli.out"
+rejects "--delay above 65535 is rejected"      "$BIN" scr2gif --delay 70000 "$TMP/seed.scr" "$TMP/cli.out"
+rejects "unknown option is rejected"           "$BIN" png2scr --dihter "$TMP/p0.png" "$TMP/cli.out"
+rejects "option missing its value is rejected" "$BIN" scr2png "$TMP/seed.scr" "$TMP/cli.out" --scale
+"$BIN" png2scr --no-bright "$TMP/p0.png" "$TMP/nb.scr" 2>&1 >/dev/null | grep -q "Warning: --no-bright ignored" \
+    && ok "--no-bright without --photo warns" || bad "--no-bright without --photo warns"
+"$BIN" scr2png --scale 32 "$TMP/seed.scr" "$TMP/big.png" >/dev/null \
+    && ok "--scale 32 (the cap) still works" || bad "--scale 32 (the cap) still works"
+if "$BIN" info "$TMP/p0.png" >/dev/null; then bad "info exits non-zero on unrecognised input"
+else ok "info exits non-zero on unrecognised input"; fi
+
 echo
 echo "Passed: $pass  Failed: $fail"
 [ "$fail" -eq 0 ]

@@ -17,6 +17,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
+#include <errno.h>
 
 // -- Vendored PNG decoder ------------------------------------------------
 // stb_image.h is a single-header, public-domain image loader. We compile its
@@ -140,8 +141,8 @@ static const char *Help =
     "                     that best spans its pixels; dithered in linear light.\n"
     "    --no-bright      png2scr --photo: never set BRIGHT, so the picture's\n"
     "                     white is the border's white (the border has no BRIGHT).\n"
-    "    --scale <n>      Upscale scr2png / scr2gif output by factor n.\n"
-    "    --delay <cs>     FLASH frame delay for scr2gif, centiseconds\n"
+    "    --scale <n>      Upscale scr2png / scr2gif output by factor n (1-32).\n"
+    "    --delay <cs>     FLASH frame delay for scr2gif, centiseconds, 1-65535\n"
     "                     (default 32 = the hardware ~1.56 Hz rate).\n"
     "\n"
     "Examples:\n"
@@ -1457,14 +1458,15 @@ static void printPalette(const byte *clut)
     }
 }
 
-static void cmdInfo(const char *in)
+// Returns the process exit status: 1 if the file is not a recognised screen.
+static int cmdInfo(const char *in)
 {
     size_t len;
     byte *scr = readFile(in, &len);
     Detected d = detect(len);
     printf("File: %s\n", in);
     printf("Size: %zu bytes\n", len);
-    if (!d.valid) { printf("Mode: unrecognised\n"); free(scr); return; }
+    if (!d.valid) { printf("Mode: unrecognised\n"); free(scr); return 1; }
 
     const byte *clut = d.palette ? scr + len - PAL_SIZE : NULL;
 
@@ -1514,9 +1516,36 @@ static void cmdInfo(const char *in)
         if (d.palette) printPalette(clut);
     }
     free(scr);
+    return 0;
 }
 
 //~~~~ main ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~//
+
+// Parse a whole-string decimal integer in [lo, hi] for option `opt`, or die.
+// (atoi silently turned "abc" into 0 and let out-of-range values wrap.)
+static int parseIntOpt(const char *opt, const char *s, long lo, long hi)
+{
+    char *end;
+    errno = 0;
+    long v = strtol(s, &end, 10);
+    if (errno || end == s || *end != '\0' || v < lo || v > hi)
+    {
+        fprintf(stderr, "Invalid value \"%s\" for %s (expected an integer %ld-%ld)\n",
+                s, opt, lo, hi);
+        exit(1);
+    }
+    return (int)v;
+}
+
+// Upper bound for --scale. Keeps every output within format limits (GIF
+// dimensions are 16-bit; a PNG chunk is < 2^31 bytes) and every size
+// computation far from int overflow: 512*32 x 192*32 RGB is ~300 MB.
+#define MAX_SCALE 32
+
+static void warnIgnored(const char *opt, const char *why)
+{
+    fprintf(stderr, "Warning: %s ignored (%s)\n", opt, why);
+}
 
 int main(int argc, char **argv)
 {
@@ -1524,38 +1553,52 @@ int main(int argc, char **argv)
     enum Mode mode = mStd;
     const char *fileIn = NULL, *fileOut = NULL;
     int normal = DEF_NORMAL, scale = 1, delayCs = 32, ulaplus = 0, dither = 0, photo = 0, noBright = 0;
+    // Which options were given explicitly, so inapplicable ones can be flagged.
+    int setLevel = 0, setScale = 0, setDelay = 0, setMode = 0;
 
     for (int i = 1; i < argc; i++)
     {
         const char *a = argv[i];
+        // Options that take a value: fail clearly if it is missing, instead of
+        // the option name falling through to be read as a file name.
+        int needsValue = strcmp(a, "--level") == 0 || strcmp(a, "--scale") == 0 ||
+                         strcmp(a, "--delay") == 0 || strcmp(a, "--palette") == 0 ||
+                         strcmp(a, "--mode") == 0;
+        if (needsValue && i + 1 >= argc) die("Missing value for option", a);
+
         if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) { printf("%s", Help); return 0; }
-        else if (strcmp(a, "--level") == 0 && i + 1 < argc) normal = atoi(argv[++i]) & 0xff;
-        else if (strcmp(a, "--scale") == 0 && i + 1 < argc) { scale = atoi(argv[++i]); if (scale < 1) scale = 1; }
-        else if (strcmp(a, "--delay") == 0 && i + 1 < argc) { delayCs = atoi(argv[++i]); if (delayCs < 1) delayCs = 1; }
+        else if (strcmp(a, "--level") == 0) { normal  = parseIntOpt(a, argv[++i], 0, 255); setLevel = 1; }
+        else if (strcmp(a, "--scale") == 0) { scale   = parseIntOpt(a, argv[++i], 1, MAX_SCALE); setScale = 1; }
+        else if (strcmp(a, "--delay") == 0) { delayCs = parseIntOpt(a, argv[++i], 1, 65535); setDelay = 1; }
         else if (strcmp(a, "--ulaplus") == 0) ulaplus = 1;
         else if (strcmp(a, "--dither") == 0) dither = 1;
         else if (strcmp(a, "--photo") == 0) photo = 1;
         else if (strcmp(a, "--no-bright") == 0) noBright = 1;
-        else if (strcmp(a, "--palette") == 0 && i + 1 < argc)
+        else if (strcmp(a, "--palette") == 0)
         {
             const char *p = argv[++i];
             if      (strcmp(p, "standard") == 0) normal = 0xD7;
             else if (strcmp(p, "classic")  == 0) normal = 0xCD;
             else if (strcmp(p, "emulator") == 0) normal = 0xC0;
             else die("Unknown palette (use standard|classic|emulator):", p);
+            setLevel = 1;
         }
-        else if (strcmp(a, "--mode") == 0 && i + 1 < argc)
+        else if (strcmp(a, "--mode") == 0)
         {
             const char *m = argv[++i];
             if      (strcmp(m, "std")      == 0) mode = mStd;
             else if (strcmp(m, "hicolour") == 0 || strcmp(m, "hicolor") == 0) mode = mHiColour;
             else if (strcmp(m, "hires")    == 0) mode = mHiRes;
             else die("Unknown mode (use std|hicolour|hires):", m);
+            setMode = 1;
         }
         else if (cmd == cmNone && strcmp(a, "png2scr") == 0) cmd = cmPng2Scr;
         else if (cmd == cmNone && strcmp(a, "scr2png") == 0) cmd = cmScr2Png;
         else if (cmd == cmNone && strcmp(a, "scr2gif") == 0) cmd = cmScr2Gif;
         else if (cmd == cmNone && strcmp(a, "info") == 0)    cmd = cmInfo;
+        // Anything else dash-prefixed is a mistyped option, not a file name
+        // ("-" alone is left alone as a conventional file-name placeholder).
+        else if (a[0] == '-' && a[1] != '\0') die("Unknown option (see --help):", a);
         else if (!fileIn)  fileIn = a;
         else if (!fileOut) fileOut = a;
         else die("Unexpected argument:", a);
@@ -1563,6 +1606,33 @@ int main(int argc, char **argv)
 
     if (cmd == cmNone) { fprintf(stderr, "%s", Help); return 1; }
     if (!fileIn) die("Missing input file", NULL);
+
+    // Flag options that have no effect for this command instead of silently
+    // dropping them (the run still proceeds).
+    if (cmd != cmPng2Scr)
+    {
+        if (setMode)  warnIgnored("--mode", "png2scr only; other commands detect the mode from the file size");
+        if (ulaplus)  warnIgnored("--ulaplus", "png2scr only; ULAplus input is auto-detected");
+        if (dither)   warnIgnored("--dither", "png2scr only");
+        if (photo)    warnIgnored("--photo", "png2scr only");
+        if (noBright) warnIgnored("--no-bright", "png2scr --photo only");
+    }
+    else
+    {
+        if (noBright && !photo) warnIgnored("--no-bright", "needs --photo");
+        if (dither && photo)    warnIgnored("--dither", "--photo always dithers");
+        if (setScale)           warnIgnored("--scale", "scr2png / scr2gif only");
+        if (setLevel && (ulaplus || mode == mHiRes))
+            warnIgnored("--level/--palette", ulaplus ? "ULAplus uses its own palette"
+                                                     : "hi-res colours are always BRIGHT");
+    }
+    if (setDelay && cmd != cmScr2Gif) warnIgnored("--delay", "scr2gif only");
+    if (cmd == cmInfo)
+    {
+        if (setScale) warnIgnored("--scale", "scr2png / scr2gif only");
+        if (setLevel) warnIgnored("--level/--palette", "info does not render");
+    }
+    if (cmd == cmInfo && fileOut) die("Unexpected argument:", fileOut);
 
     switch (cmd)
     {
@@ -1593,8 +1663,7 @@ int main(int argc, char **argv)
             cmdScr2Gif(fileIn, fileOut, normal, scale, delayCs);
             break;
         case cmInfo:
-            cmdInfo(fileIn);
-            break;
+            return cmdInfo(fileIn);
         default: break;
     }
     return 0;
