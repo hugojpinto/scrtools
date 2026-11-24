@@ -181,7 +181,7 @@ make mac        # macOS universal binary (arm64 + x86_64)
 make linux      # Linux x86_64, static (musl)
 make windows    # Windows x86_64, static (mingw)
 make release    # all three
-make test       # build, then run the regression suite
+make test       # build, then run the regression suite (needs Python 3 + Pillow)
 ```
 
 Cross-compiling from macOS needs the toolchains:

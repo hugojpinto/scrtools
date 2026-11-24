@@ -18,6 +18,13 @@ BIN="${1:-./scrtools}"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
+# The checks decode PNG/GIF output with Pillow; fail loudly up front if absent
+# (under `set -e` a missing module would otherwise abort mid-run, unexplained).
+if ! python3 -c 'import PIL' 2>/dev/null; then
+    echo "regression.sh needs Python 3 with Pillow (pip install pillow)" >&2
+    exit 2
+fi
+
 pass=0; fail=0
 ok()   { echo "  ok   - $1"; pass=$((pass+1)); }
 bad()  { echo "  FAIL - $1"; fail=$((fail+1)); }
@@ -25,7 +32,7 @@ bad()  { echo "  FAIL - $1"; fail=$((fail+1)); }
 # --- Build a tiny known SCREEN$ entirely in the shell -------------------
 # 6144 zero pixel bytes + 768 attribute bytes. We set a handful of cells to
 # distinct ink/paper colours so the conversions have something to chew on.
-python3 - "$TMP/seed.scr" <<'PY'
+if python3 - "$TMP/seed.scr" <<'PY'
 import sys
 scr = bytearray(6912)
 # Lay a simple gradient of attributes across the 768 cells.
@@ -116,13 +123,12 @@ n=getattr(im,"n_frames",1)
 print("frames",n)
 sys.exit(0 if n==2 else 1)
 PY
-[ $? -eq 0 ] && ok "scr2gif emits a 2-frame animation for flashing screens" \
-    || bad "scr2gif animation"
+then ok "scr2gif emits a 2-frame animation for flashing screens"; else bad "scr2gif animation"; fi
 
 # --- Test 7: ULAplus standard, lossless fast path (6976 bytes) ----------
 # Build a 256x192 image using <=8 GRB332-exact colours, <=2 per 8x8 cell, so
 # the quantiser's single-group fast path applies and the round-trip is lossless.
-python3 - "$TMP/ula.png" <<'PY'
+if python3 - "$TMP/ula.png" <<'PY'
 import sys
 from PIL import Image
 P=[(182,0,0),(0,182,0),(0,0,182),(182,182,0),
@@ -160,10 +166,10 @@ from PIL import Image
 im=Image.open(sys.argv[1])
 sys.exit(0 if getattr(im,"n_frames",1)==1 else 1)   # ULAplus never flashes
 PY
-[ $? -eq 0 ] && ok "ULAplus scr2gif is a single static frame" || bad "ULAplus gif frames"
+then ok "ULAplus scr2gif is a single static frame"; else bad "ULAplus gif frames"; fi
 
 # --- Test 10: quantiser produces >15 colours from a truecolour image ----
-python3 - "$TMP/grad.png" <<'PY'
+if python3 - "$TMP/grad.png" <<'PY'
 import sys
 from PIL import Image
 im=Image.new("RGB",(256,192)); px=im.load()
@@ -182,7 +188,7 @@ n=len(im.getcolors(maxcolors=70) or [])
 print("quantiser colours:", n)
 sys.exit(0 if n>15 else 1)
 PY
-[ $? -eq 0 ] && ok "ULAplus quantiser uses more than 15 colours" || bad "ULAplus quantiser colours"
+then ok "ULAplus quantiser uses more than 15 colours"; else bad "ULAplus quantiser colours"; fi
 
 # --- Test 11: --dither changes the bitmap and stays valid ---------------
 # On a smooth gradient, dithering must alter the bitmap (vs flat fill) while
