@@ -29,14 +29,20 @@ Options:
                        hires      512x192 mono+colour -> 12289 bytes
     --ulaplus        png2scr: emit a ULAplus 64-colour screen (+64 palette
                      bytes -> 6976 / 12352). std and hicolour only.
-    --level <n>      Normal (non-bright) colour level for rendering,
-                     0-255 (default 215 = 0xD7). Bright stays 255.
+    --level <n>      Normal (non-bright) colour level, 0-255 (default
+                     215 = 0xD7); bright stays 255. Used for rendering, and
+                     by png2scr std/hicolour to match colours.
     --palette <p>    Named level preset: standard (215, default),
                      classic (205), emulator (192).
     --dither         png2scr: Floyd-Steinberg dither the bitmap between
                      each cell's two colours (helps shaded images).
-    --scale <n>      Upscale scr2png / scr2gif output by factor n.
-    --delay <cs>     FLASH frame delay for scr2gif, centiseconds
+    --photo          png2scr (std/hicolour): for photographs -- each cell
+                     tries every ink/paper/BRIGHT pair and keeps the one
+                     that best spans its pixels; dithered in linear light.
+    --no-bright      png2scr --photo: never set BRIGHT, so the picture's
+                     white is the border's white (the border has no BRIGHT).
+    --scale <n>      Upscale scr2png / scr2gif output by factor n (1-32).
+    --delay <cs>     FLASH frame delay for scr2gif, centiseconds, 1-65535
                      (default 32 = the hardware ~1.56 Hz rate).
 
 Examples:
@@ -45,6 +51,7 @@ Examples:
     scrtools png2scr --mode hicolour pic.png pic.scr
     scrtools png2scr --ulaplus photo.png photo.scr
     scrtools png2scr --ulaplus --dither photo.png photo.scr
+    scrtools png2scr --mode hicolour --photo machine.png machine.scr
     scrtools scr2png demo.scr demo.png
     scrtools scr2png --palette emulator demo.scr demo.png
     scrtools scr2gif --scale 2 demo.scr demo.gif
@@ -133,8 +140,10 @@ defaults to the modern de-facto standard and lets you override it:
 
 Bright lit channels are always `0xFF`; black is `0x000000` in both intensities
 (hence 15 distinct colours, not 16). The `.scr` itself stores no RGB, so the
-level only affects rendering — use `--level 191` to reproduce a PNG authored
-with the `0xBF` convention, for example.
+level mainly affects rendering — use `--level 191` to reproduce a PNG authored
+with the `0xBF` convention, for example. `png2scr` (std / hi-colour, including
+`--photo`) also uses it as the target colour when matching pixels; ULAplus has
+its own palette and hi-res is always BRIGHT, so they ignore it.
 
 ## Conversion notes
 
@@ -144,7 +153,8 @@ with the `0xBF` convention, for example.
   faithful render converts losslessly; a clashing cell snaps to its two dominant
   colours rather than being rejected. `--dither` adds Floyd-Steinberg error
   diffusion when choosing ink-vs-paper per pixel, trading hard edges for smooth
-  shading — most useful on gradients and photos.
+  shading — most useful on gradients and photos. Transparent PNG pixels are
+  composited onto black (with a warning).
 * The rendered image is the canonical truth: `png → scr → png` is
   **pixel-identical** (at a matching `--level`), and `png2scr` output is a stable
   **fixed point**. On real Timex hi-res samples, `scr → png → scr` is even
@@ -175,7 +185,7 @@ make mac        # macOS universal binary (arm64 + x86_64)
 make linux      # Linux x86_64, static (musl)
 make windows    # Windows x86_64, static (mingw)
 make release    # all three
-make test       # build, then run the regression suite
+make test       # build, then run the regression suite (needs Python 3 + Pillow)
 ```
 
 Cross-compiling from macOS needs the toolchains:

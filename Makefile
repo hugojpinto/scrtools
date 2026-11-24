@@ -27,7 +27,7 @@ else
 	else
 		# --- Linux / other GNU toolchains ---
 		LDFLAGS=-s -fmerge-all-constants -Wl,--gc-sections \
-		        -Wl,--build-id=none -static-libgcc
+		        -Wl,--build-id=none -static-libgcc -lm
 	endif
 endif
 
@@ -62,13 +62,13 @@ mac: scrtools.c
 linux: scrtools.c
 	$(info Building Linux static "scrtools-linux")
 	$(CC_LINUX) scrtools.c -o scrtools-linux $(CFLAGS) -static -s \
-		-fmerge-all-constants -Wl,--gc-sections -Wl,--build-id=none
+		-fmerge-all-constants -Wl,--gc-sections -Wl,--build-id=none -lm
 
 # Windows x86_64, statically linked (mingw).
 windows: scrtools.c
 	$(info Building Windows static "scrtools.exe")
 	$(CC_WIN) scrtools.c -o scrtools.exe $(CFLAGS) -static -s \
-		-fmerge-all-constants -Wl,--gc-sections -static-libgcc
+		-fmerge-all-constants -Wl,--gc-sections -static-libgcc -lm
 
 # All three release binaries.
 release: mac linux windows

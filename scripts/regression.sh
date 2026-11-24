@@ -18,6 +18,13 @@ BIN="${1:-./scrtools}"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
+# The checks decode PNG/GIF output with Pillow; fail loudly up front if absent
+# (under `set -e` a missing module would otherwise abort mid-run, unexplained).
+if ! python3 -c 'import PIL' 2>/dev/null; then
+    echo "regression.sh needs Python 3 with Pillow (pip install pillow)" >&2
+    exit 2
+fi
+
 pass=0; fail=0
 ok()   { echo "  ok   - $1"; pass=$((pass+1)); }
 bad()  { echo "  FAIL - $1"; fail=$((fail+1)); }
@@ -25,7 +32,7 @@ bad()  { echo "  FAIL - $1"; fail=$((fail+1)); }
 # --- Build a tiny known SCREEN$ entirely in the shell -------------------
 # 6144 zero pixel bytes + 768 attribute bytes. We set a handful of cells to
 # distinct ink/paper colours so the conversions have something to chew on.
-python3 - "$TMP/seed.scr" <<'PY'
+if python3 - "$TMP/seed.scr" <<'PY'
 import sys
 scr = bytearray(6912)
 # Lay a simple gradient of attributes across the 768 cells.
@@ -116,13 +123,12 @@ n=getattr(im,"n_frames",1)
 print("frames",n)
 sys.exit(0 if n==2 else 1)
 PY
-[ $? -eq 0 ] && ok "scr2gif emits a 2-frame animation for flashing screens" \
-    || bad "scr2gif animation"
+then ok "scr2gif emits a 2-frame animation for flashing screens"; else bad "scr2gif animation"; fi
 
 # --- Test 7: ULAplus standard, lossless fast path (6976 bytes) ----------
 # Build a 256x192 image using <=8 GRB332-exact colours, <=2 per 8x8 cell, so
 # the quantiser's single-group fast path applies and the round-trip is lossless.
-python3 - "$TMP/ula.png" <<'PY'
+if python3 - "$TMP/ula.png" <<'PY'
 import sys
 from PIL import Image
 P=[(182,0,0),(0,182,0),(0,0,182),(182,182,0),
@@ -160,10 +166,10 @@ from PIL import Image
 im=Image.open(sys.argv[1])
 sys.exit(0 if getattr(im,"n_frames",1)==1 else 1)   # ULAplus never flashes
 PY
-[ $? -eq 0 ] && ok "ULAplus scr2gif is a single static frame" || bad "ULAplus gif frames"
+then ok "ULAplus scr2gif is a single static frame"; else bad "ULAplus gif frames"; fi
 
 # --- Test 10: quantiser produces >15 colours from a truecolour image ----
-python3 - "$TMP/grad.png" <<'PY'
+if python3 - "$TMP/grad.png" <<'PY'
 import sys
 from PIL import Image
 im=Image.new("RGB",(256,192)); px=im.load()
@@ -182,7 +188,7 @@ n=len(im.getcolors(maxcolors=70) or [])
 print("quantiser colours:", n)
 sys.exit(0 if n>15 else 1)
 PY
-[ $? -eq 0 ] && ok "ULAplus quantiser uses more than 15 colours" || bad "ULAplus quantiser colours"
+then ok "ULAplus quantiser uses more than 15 colours"; else bad "ULAplus quantiser colours"; fi
 
 # --- Test 11: --dither changes the bitmap and stays valid ---------------
 # On a smooth gradient, dithering must alter the bitmap (vs flat fill) while
@@ -195,6 +201,62 @@ cmp -s "$TMP/g_nd.scr" "$TMP/g_d.scr" \
 # ULAplus + dither must also yield a valid 6976-byte screen.
 "$BIN" png2scr --ulaplus --dither "$TMP/grad.png" "$TMP/g_ud.scr" >/dev/null
 [ "$(wc -c < "$TMP/g_ud.scr")" -eq 6976 ] && ok "dithered ULAplus is 6976 bytes" || bad "dithered ULAplus size"
+
+# --- Test 12: --photo -----------------------------------------------------
+# Sizes are right, and a screen that is already in the Spectrum palette (the
+# seed render) survives: every cell's pair can reproduce its pixels exactly.
+"$BIN" png2scr --photo "$TMP/grad.png" "$TMP/g_p.scr" >/dev/null
+[ "$(wc -c < "$TMP/g_p.scr")" -eq 6912 ] && ok "photo std is 6912 bytes" || bad "photo std size"
+"$BIN" png2scr --mode hicolour --photo "$TMP/grad.png" "$TMP/g_ph.scr" >/dev/null
+[ "$(wc -c < "$TMP/g_ph.scr")" -eq 12288 ] && ok "photo hicolour is 12288 bytes" || bad "photo hicolour size"
+"$BIN" png2scr --photo "$TMP/p0.png" "$TMP/seed_p.scr" >/dev/null
+"$BIN" scr2png "$TMP/seed_p.scr" "$TMP/seed_p.png" >/dev/null
+cmp -s "$TMP/p0.png" "$TMP/seed_p.png" && ok "photo reproduces a palette-exact screen" \
+    || bad "photo reproduces a palette-exact screen"
+
+# --- Test 13: CLI validation (audit fixes) -------------------------------
+# rejects WHAT CMD...: CMD must exit non-zero and write no output file.
+rejects() { local what="$1"; shift
+    rm -f "$TMP/cli.out"
+    if "$@" >/dev/null 2>&1 || [ -e "$TMP/cli.out" ]; then bad "$what"; else ok "$what"; fi; }
+rejects "--level out of range is rejected"     "$BIN" scr2png --level 300 "$TMP/seed.scr" "$TMP/cli.out"
+rejects "--level non-number is rejected"       "$BIN" scr2png --level abc "$TMP/seed.scr" "$TMP/cli.out"
+rejects "--scale above the cap is rejected"    "$BIN" scr2gif --scale 256 "$TMP/seed.scr" "$TMP/cli.out"
+rejects "--scale 0 is rejected"                "$BIN" scr2png --scale 0 "$TMP/seed.scr" "$TMP/cli.out"
+rejects "--delay above 65535 is rejected"      "$BIN" scr2gif --delay 70000 "$TMP/seed.scr" "$TMP/cli.out"
+rejects "unknown option is rejected"           "$BIN" png2scr --dihter "$TMP/p0.png" "$TMP/cli.out"
+rejects "option missing its value is rejected" "$BIN" scr2png "$TMP/seed.scr" "$TMP/cli.out" --scale
+"$BIN" png2scr --no-bright "$TMP/p0.png" "$TMP/nb.scr" 2>&1 >/dev/null | grep -q "Warning: --no-bright ignored" \
+    && ok "--no-bright without --photo warns" || bad "--no-bright without --photo warns"
+"$BIN" scr2png --scale 32 "$TMP/seed.scr" "$TMP/big.png" >/dev/null \
+    && ok "--scale 32 (the cap) still works" || bad "--scale 32 (the cap) still works"
+if "$BIN" info "$TMP/p0.png" >/dev/null; then bad "info exits non-zero on unrecognised input"
+else ok "info exits non-zero on unrecognised input"; fi
+
+# --- Test 14: --level reaches png2scr's colour matching ------------------
+# Rendered at 192, converted back at 192: still pixel-identical.
+"$BIN" scr2png --level 192 "$TMP/seed.scr" "$TMP/l192.png" >/dev/null
+"$BIN" png2scr --level 192 "$TMP/l192.png" "$TMP/l192.scr" >/dev/null
+"$BIN" scr2png --level 192 "$TMP/l192.scr" "$TMP/l192b.png" >/dev/null
+cmp -s "$TMP/l192.png" "$TMP/l192b.png" \
+    && ok "png -> scr -> png identical at --level 192" || bad "png -> scr -> png at --level 192"
+
+# --- Test 15: transparency composites onto black --------------------------
+# Fully transparent pixels hiding white RGB must convert as black, with a warning.
+python3 - "$TMP/alpha.png" <<'PY'
+import sys
+from PIL import Image
+Image.new("RGBA", (256, 192), (255, 255, 255, 0)).save(sys.argv[1])
+PY
+"$BIN" png2scr "$TMP/alpha.png" "$TMP/alpha.scr" 2>"$TMP/alpha.err" >/dev/null
+grep -q "transparent pixels" "$TMP/alpha.err" && ok "transparent PNG warns" || bad "transparent PNG warns"
+if python3 - "$TMP/alpha.scr" <<'PY'
+import sys
+d = open(sys.argv[1], "rb").read()
+# All-black screen: every attribute's ink and paper are black, no BRIGHT.
+sys.exit(0 if all((a & 0x7f) == 0 for a in d[6144:]) else 1)
+PY
+then ok "transparent pixels convert as black"; else bad "transparent pixels convert as black"; fi
 
 echo
 echo "Passed: $pass  Failed: $fail"
