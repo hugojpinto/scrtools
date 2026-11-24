@@ -130,8 +130,9 @@ static const char *Help =
     "    --ulaplus        png2scr: emit a ULAplus 64-colour screen (adds 64\n"
     "                     palette bytes -> 6976 / 12352). std and hicolour only.\n"
     "                     scr2png/scr2gif/info auto-detect ULAplus screens.\n"
-    "    --level <n>      Normal (non-bright) colour level for rendering,\n"
-    "                     0-255 (default 215 = 0xD7). Bright stays 255.\n"
+    "    --level <n>      Normal (non-bright) colour level, 0-255 (default\n"
+    "                     215 = 0xD7); bright stays 255. Used for rendering, and\n"
+    "                     by png2scr std/hicolour to match colours.\n"
     "    --palette <p>    Named level preset: standard (215, default),\n"
     "                     classic (205), emulator (192).\n"
     "    --dither         png2scr: Floyd-Steinberg dither the bitmap between\n"
@@ -681,7 +682,8 @@ static void emitBitmap256(const byte *px, int w, int f, const byte *cellInkRGB,
 
 //~~~~ png2scr: standard (8x8 attributes) ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~//
 
-static void cmdPng2ScrStd(const char *in, const char *out, int dither)
+// normal: the non-bright level the cell colours are matched against (--level).
+static void cmdPng2ScrStd(const char *in, const char *out, int dither, int normal)
 {
     int w, h, f;
     byte *px = loadPngRGB(in, SCR_W, &w, &h, &f);
@@ -719,8 +721,8 @@ static void cmdPng2ScrStd(const char *in, const char *out, int dither)
 
             int cell = cy * 32 + cx;
             scr[SCR_PIXELS + cell] = (byte)((bright << 6) | (paper << 3) | ink);
-            indexToRGB(ink,   bright, DEF_NORMAL, &cellInk[cell*3],   &cellInk[cell*3+1],   &cellInk[cell*3+2]);
-            indexToRGB(paper, bright, DEF_NORMAL, &cellPaper[cell*3], &cellPaper[cell*3+1], &cellPaper[cell*3+2]);
+            indexToRGB(ink,   bright, normal, &cellInk[cell*3],   &cellInk[cell*3+1],   &cellInk[cell*3+2]);
+            indexToRGB(paper, bright, normal, &cellPaper[cell*3], &cellPaper[cell*3+1], &cellPaper[cell*3+2]);
         }
 
     emitBitmap256(px, w, f, cellInk, cellPaper, 8, scr, dither);
@@ -731,7 +733,7 @@ static void cmdPng2ScrStd(const char *in, const char *out, int dither)
 
 //~~~~ png2scr: Timex hi-colour (8x1 attributes) ~~~~~~~~~~~~~~~~~~~~~~~~~~~//
 
-static void cmdPng2ScrHiColour(const char *in, const char *out, int dither)
+static void cmdPng2ScrHiColour(const char *in, const char *out, int dither, int normal)
 {
     int w, h, f;
     byte *px = loadPngRGB(in, SCR_W, &w, &h, &f);
@@ -766,8 +768,8 @@ static void cmdPng2ScrHiColour(const char *in, const char *out, int dither)
 
             int cell = y * 32 + cx;
             att[PIX_OFF(y, cx * 8)] = (byte)((bright << 6) | (paper << 3) | ink);
-            indexToRGB(ink,   bright, DEF_NORMAL, &cellInk[cell*3],   &cellInk[cell*3+1],   &cellInk[cell*3+2]);
-            indexToRGB(paper, bright, DEF_NORMAL, &cellPaper[cell*3], &cellPaper[cell*3+1], &cellPaper[cell*3+2]);
+            indexToRGB(ink,   bright, normal, &cellInk[cell*3],   &cellInk[cell*3+1],   &cellInk[cell*3+2]);
+            indexToRGB(paper, bright, normal, &cellPaper[cell*3], &cellPaper[cell*3+1], &cellPaper[cell*3+2]);
         }
 
     emitBitmap256(px, w, f, cellInk, cellPaper, 1, scr, dither);
@@ -1650,8 +1652,8 @@ int main(int argc, char **argv)
                 else die("hi-res + ULAplus output is not supported "
                          "(the palette mapping is under-specified)", NULL);
             }
-            else if (mode == mStd)      cmdPng2ScrStd(fileIn, fileOut, dither);
-            else if (mode == mHiColour) cmdPng2ScrHiColour(fileIn, fileOut, dither);
+            else if (mode == mStd)      cmdPng2ScrStd(fileIn, fileOut, dither, normal);
+            else if (mode == mHiColour) cmdPng2ScrHiColour(fileIn, fileOut, dither, normal);
             else                        cmdPng2ScrHiRes(fileIn, fileOut, dither);
             break;
         case cmScr2Png:

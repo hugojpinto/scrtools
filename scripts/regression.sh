@@ -233,6 +233,14 @@ rejects "option missing its value is rejected" "$BIN" scr2png "$TMP/seed.scr" "$
 if "$BIN" info "$TMP/p0.png" >/dev/null; then bad "info exits non-zero on unrecognised input"
 else ok "info exits non-zero on unrecognised input"; fi
 
+# --- Test 14: --level reaches png2scr's colour matching ------------------
+# Rendered at 192, converted back at 192: still pixel-identical.
+"$BIN" scr2png --level 192 "$TMP/seed.scr" "$TMP/l192.png" >/dev/null
+"$BIN" png2scr --level 192 "$TMP/l192.png" "$TMP/l192.scr" >/dev/null
+"$BIN" scr2png --level 192 "$TMP/l192.scr" "$TMP/l192b.png" >/dev/null
+cmp -s "$TMP/l192.png" "$TMP/l192b.png" \
+    && ok "png -> scr -> png identical at --level 192" || bad "png -> scr -> png at --level 192"
+
 echo
 echo "Passed: $pass  Failed: $fail"
 [ "$fail" -eq 0 ]

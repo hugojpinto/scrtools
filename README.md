@@ -29,8 +29,9 @@ Options:
                        hires      512x192 mono+colour -> 12289 bytes
     --ulaplus        png2scr: emit a ULAplus 64-colour screen (+64 palette
                      bytes -> 6976 / 12352). std and hicolour only.
-    --level <n>      Normal (non-bright) colour level for rendering,
-                     0-255 (default 215 = 0xD7). Bright stays 255.
+    --level <n>      Normal (non-bright) colour level, 0-255 (default
+                     215 = 0xD7); bright stays 255. Used for rendering, and
+                     by png2scr std/hicolour to match colours.
     --palette <p>    Named level preset: standard (215, default),
                      classic (205), emulator (192).
     --dither         png2scr: Floyd-Steinberg dither the bitmap between
@@ -139,8 +140,10 @@ defaults to the modern de-facto standard and lets you override it:
 
 Bright lit channels are always `0xFF`; black is `0x000000` in both intensities
 (hence 15 distinct colours, not 16). The `.scr` itself stores no RGB, so the
-level only affects rendering — use `--level 191` to reproduce a PNG authored
-with the `0xBF` convention, for example.
+level mainly affects rendering — use `--level 191` to reproduce a PNG authored
+with the `0xBF` convention, for example. `png2scr` (std / hi-colour, including
+`--photo`) also uses it as the target colour when matching pixels; ULAplus has
+its own palette and hi-res is always BRIGHT, so they ignore it.
 
 ## Conversion notes
 
