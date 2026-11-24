@@ -62,10 +62,11 @@ typedef unsigned char byte;
 //     Crucially, block 2 uses the SAME interleaved address scheme as block 1,
 //     so the attribute for pixel (x,y) lives at the very same offset in block 2
 //     as the pixel byte does in block 1.
-//   - Hi-res (12288/12289 bytes): 512x192 monochrome. Even pixel columns come
+//   - Hi-res (12289 bytes): 512x192 monochrome. Even pixel columns come
 //     from block 1, odd columns from block 2 (each block a normal interleaved
 //     256x192 bitmap). A trailing byte (-> 12289) is the raw port-0xFF value;
 //     its bits 3-5 are the global INK colour and PAPER = 7 - INK, both BRIGHT.
+//     (A bare 12288-byte file is ambiguous and is always read as hi-colour.)
 //
 // Colour bits (per Spectrum hardware): bit0 BLUE, bit1 RED, bit2 GREEN.
 
@@ -883,7 +884,7 @@ static void cmdPng2ScrPhoto(const char *in, const char *out, int cellH, int norm
     {
         double (*cur)[3] = err[y & 1] + 1, (*nxt)[3] = err[(y + 1) & 1] + 1;
         memset(err[(y + 1) & 1], 0, sizeof err[0]);
-        int bits = 0, inkCount[32] = {0};
+        int bits = 0;
         for (int x = 0; x < SCR_W; x++)
         {
             int cell = (y / cellH) * 32 + (x >> 3);
@@ -895,7 +896,7 @@ static void cmdPng2ScrPhoto(const char *in, const char *out, int cellH, int norm
                 da += (t[c] - a[c]) * (t[c] - a[c]); db += (t[c] - b[c]) * (t[c] - b[c]);
             }
             const double *ch = (db < da) ? b : a;
-            if (db < da) { bits |= 0x80 >> (x & 7); inkCount[x >> 3]++; }
+            if (db < da) bits |= 0x80 >> (x & 7);
             for (int c = 0; c < 3; c++)
             {
                 double e = t[c] - ch[c];
